@@ -43,8 +43,8 @@ insurance-tracking-ui/
 ### Install
 
 ```bash
-git clone https://github.com/your-username/vibecheck.git
-cd vibecheck
+git clone git@bitbucket.org:rafidowla/vibecheck.git
+cd VibeCheck
 python -m venv venv
 source venv/bin/activate        # macOS/Linux
 # venv\Scripts\activate          # Windows
@@ -54,7 +54,11 @@ pip install -r requirements.txt
 
 ### Configure
 
-Create a `.env` file:
+Copy the example file and fill in your values:
+
+```bash
+cp .env.example .env
+```
 
 ```env
 # Required: OpenRouter API key (get one at https://openrouter.ai)
@@ -65,6 +69,9 @@ OPENROUTER_MODEL=qwen/qwen2.5-vl-72b-instruct
 
 # Default Whisper model (can also be changed per-session in the UI)
 WHISPER_MODEL=medium-q5
+
+# Output directory (default: ~/Downloads/vibecheck-output)
+# OUTPUT_DIR=~/Downloads/vibecheck-output
 ```
 
 ### Run
@@ -102,13 +109,18 @@ Models auto-download on first use.
 ## 🧱 Architecture
 
 ```
-audit_tool/
-├── main.py              ← Tkinter GUI + orchestration
-├── audio_recorder.py    ← Microphone → WAV (sounddevice)
-├── mouse_tracker.py     ← Click capture + annotated screenshots
-├── transcriber.py       ← WAV → text (whisper.cpp subprocess)
-├── report_generator.py  ← Transcript + screenshots → HTML/DOCX/MD
-└── config.py            ← Environment variables + session dirs
+VibeCheck/
+├── audit_tool/
+│   ├── main.py              ← Tkinter GUI + orchestration
+│   ├── audio_recorder.py    ← Microphone → WAV (sounddevice)
+│   ├── mouse_tracker.py     ← Click capture + annotated screenshots
+│   ├── transcriber.py       ← WAV → text (whisper.cpp subprocess)
+│   ├── report_generator.py  ← Transcript + screenshots → HTML/DOCX/MD
+│   └── config.py            ← Environment variables + session dirs
+├── models/                  ← Local Whisper model binaries (auto-populated)
+│   └── ggml-<model>.bin     ← Downloaded on first use per selected model
+├── .env.example             ← Template for required environment variables
+└── requirements.txt         ← Python dependencies
 ```
 
 **Processing pipeline:**

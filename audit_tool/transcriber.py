@@ -304,6 +304,11 @@ def transcribe(
         model_size,
     )
 
+    # Determine thread count: use half the logical CPUs (Metal offloads the
+    # heavy compute, so fewer CPU threads avoids contention with the GPU).
+    import os as _os
+    cpu_threads = max(2, _os.cpu_count() // 2)
+
     try:
         result = subprocess.run(
             [
@@ -312,6 +317,8 @@ def transcribe(
                 "-f", str(converted_path),
                 "--output-txt",
                 "--print-progress",
+                "--gpu",          # enable Metal GPU on Apple Silicon (no-op on Intel)
+                "--threads", str(cpu_threads),
             ],
             capture_output=True,
             text=True,

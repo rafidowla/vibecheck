@@ -37,6 +37,7 @@ Concurrency: Uses ``threading.Thread`` for blocking operations.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -52,9 +53,9 @@ import mss
 from PIL import Image, ImageTk
 
 from audit_tool.audio_recorder import AudioRecorder
-from audit_tool.config import create_session_dir, OPENROUTER_API_KEY, ProcessMode
+from audit_tool.config import create_session_dir, OPENROUTER_API_KEY, ProcessMode, JIRA_CONFIG
 from audit_tool.mouse_tracker import ClickRecord, MouseTracker
-from audit_tool.report_generator import generate_report, cleanup_session, ReportResult
+from audit_tool.report_generator import generate_report, cleanup_session, ReportResult, push_to_jira
 from audit_tool.transcriber import transcribe, WHISPER_MODELS, WHISPER_MODEL_SIZE
 
 # ---------------------------------------------------------------------------
@@ -945,6 +946,10 @@ class AuditRecorderApp:
                 self._session_dir, segments, clicks, mode=self._process_mode
             )
 
+            # Take a snapshot of clicks before we delete them — needed for
+            # the on-demand Jira push button in _show_completion_dialog.
+            clicks_snapshot = list(clicks)
+
             # Release large objects now that reports are written
             del segments, clicks
             gc.collect()
@@ -964,7 +969,14 @@ class AuditRecorderApp:
             self._set_status_threadsafe(
                 f"✅  Report saved: {final_report.name}{cost_str}{jira_str}"
             )
-            self._open_file(final_report)
+            # Show completion dialog from main thread, passing the result
+            # and the snapshot of clicks needed for on-demand Jira push.
+            self._root.after(
+                0,
+                lambda r=result, p=final_report, c=clicks_snapshot: (
+                    self._show_completion_dialog(r, p, c)
+                ),
+            )
 
         except Exception as processing_error:
             logger.exception("Session processing failed")
@@ -1019,9 +1031,175 @@ class AuditRecorderApp:
         self._click_count_label.configure(text="")
         self._refresh_thumbnails()
 
+    def _show_completion_dialog(
+        self,
+        result: ReportResult,
+        report_path: Path,
+        clicks: list,
+    ) -> None:
+        """Show the post-processing completion dialog.
+
+        Displays the report filename, AI cost, any auto-pushed Jira keys,
+        and — when Jira is configured — a manual "Push to Jira" button.
+        Also opens the HTML report automatically.
+
+        Args:
+            result: The ``ReportResult`` from ``generate_report``.
+            report_path: Resolved final path to the HTML report.
+            clicks: Click records snapshot (needed for Jira attachment lookup).
+
+        Side Effects:
+            Opens the report file. Creates a modal ``Toplevel`` dialog.
+        """
+        # Open report in browser immediately
+        self._open_file(report_path)
+
+        dialog = tk.Toplevel(self._root)
+        dialog.title("✅ Report Complete")
+        dialog.configure(bg=BG)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        dialog.transient(self._root)
+
+        # Centre on parent
+        dialog.update_idletasks()
+        parent_x = self._root.winfo_rootx()
+        parent_y = self._root.winfo_rooty()
+        parent_w = self._root.winfo_width()
+        dialog.geometry(f"+{parent_x + parent_w // 2 - 220}+{parent_y + 80}")
+
+        # ── Header ──
+        tk.Label(
+            dialog,
+            text="✅  Report Ready",
+            font=(FONT, 14, "bold"),
+            fg="#4ecca3",
+            bg=BG,
+        ).pack(anchor="w", padx=24, pady=(20, 4))
+
+        tk.Label(
+            dialog,
+            text=report_path.name,
+            font=(FONT, 10),
+            fg=FG_DIM,
+            bg=BG,
+            anchor="w",
+        ).pack(anchor="w", padx=24)
+
+        # ── Cost / Jira row ──
+        info_frame = tk.Frame(dialog, bg=BG)
+        info_frame.pack(fill="x", padx=24, pady=(10, 0))
+
+        if result.cost_usd:
+            tk.Label(
+                info_frame,
+                text=f"💰  {result.cost_display}",
+                font=(FONT, 10),
+                fg=FG_DIM,
+                bg=BG,
+            ).pack(anchor="w")
+
+        auto_keys_label = None
+        if result.jira_keys:
+            auto_keys_label = tk.Label(
+                info_frame,
+                text=f"🔗  Auto-pushed: {', '.join(result.jira_keys)}",
+                font=(FONT, 10),
+                fg="#4ecca3",
+                bg=BG,
+            )
+            auto_keys_label.pack(anchor="w", pady=(4, 0))
+
+        # ── Jira push status label (shown during/after manual push) ──
+        jira_status_label = tk.Label(
+            dialog,
+            text="",
+            font=(FONT, 10),
+            fg=FG_DIM,
+            bg=BG,
+            wraplength=380,
+            justify="left",
+        )
+        jira_status_label.pack(anchor="w", padx=24, pady=(4, 0))
+
+        # ── Buttons ──
+        sep = tk.Frame(dialog, bg=BORDER, height=1)
+        sep.pack(fill="x", padx=24, pady=(14, 12))
+
+        btn_frame = tk.Frame(dialog, bg=BG)
+        btn_frame.pack(fill="x", padx=24, pady=(0, 20))
+
+        # Push to Jira button — only shown when Jira is configured
+        if JIRA_CONFIG is not None and not result.jira_keys:
+            jira_btn_ref: list[Optional["StyledButton"]] = [None]
+
+            def _push_to_jira_thread():
+                """Background: push tasks to Jira and update dialog."""
+                dialog.after(
+                    0,
+                    lambda: jira_status_label.configure(
+                        text="⏳  Pushing to Jira…", fg=FG_DIM
+                    ),
+                )
+                if jira_btn_ref[0]:
+                    dialog.after(0, lambda: jira_btn_ref[0].set_enabled(False))
+                try:
+                    keys = push_to_jira(
+                        JIRA_CONFIG, result.markdown_content, clicks, self._process_mode
+                    )
+                    if keys:
+                        msg = f"🔗  Created: {', '.join(keys)}"
+                        color = "#4ecca3"
+                    else:
+                        msg = "⚠️  No issues were created — check logs."
+                        color = "#e0a800"
+                    dialog.after(
+                        0,
+                        lambda m=msg, c=color: jira_status_label.configure(
+                            text=m, fg=c
+                        ),
+                    )
+                except Exception as jira_error:
+                    dialog.after(
+                        0,
+                        lambda e=str(jira_error): jira_status_label.configure(
+                            text=f"❌  Jira error: {e[:120]}", fg="#e05555"
+                        ),
+                    )
+
+            def _on_jira_push():
+                threading.Thread(
+                    target=_push_to_jira_thread, daemon=True
+                ).start()
+
+            jira_btn = StyledButton(
+                btn_frame,
+                "🔗  Push to Jira",
+                "#1a4d8c",
+                "#ffffff",
+                _on_jira_push,
+            )
+            jira_btn.pack(side="left", expand=True, fill="x", padx=(0, 6))
+            jira_btn_ref[0] = jira_btn
+
+        open_btn = StyledButton(
+            btn_frame,
+            "📂  Open Report",
+            "#22906a",
+            "#ffffff",
+            lambda: self._open_file(report_path),
+        )
+        open_btn.pack(side="left", expand=True, fill="x", padx=(0, 6))
+
+        close_btn = StyledButton(
+            btn_frame, "Close", "#3a3a4e", "#cccccc", dialog.destroy, font_size=11
+        )
+        close_btn.pack(side="left", expand=True, fill="x")
+
     @staticmethod
     def _open_file(path: Path) -> None:
         """Open a file with the system default application (macOS)."""
+
         try:
             subprocess.Popen(["open", str(path)])
         except Exception:

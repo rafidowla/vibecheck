@@ -86,6 +86,7 @@ class ReportResult:
     output_tokens: int = 0
     cost_usd: float = 0.0
     jira_keys: list[str] = field(default_factory=list)
+    markdown_content: str = ""  # stored so on-demand Jira push doesn't need to re-read disk
 
     @property
     def cost_display(self) -> str:
@@ -187,6 +188,7 @@ def generate_report(
                 output_tokens=output_tokens,
                 cost_usd=cost_usd,
                 jira_keys=jira_keys,
+                markdown_content=markdown_content,
             )
         except Exception:
             logger.exception("OpenRouter API failed — falling back to template.")
@@ -205,7 +207,7 @@ def generate_report(
     _build_docx_report(docx_path, markdown_content, transcript, clicks)
 
     logger.info("Template report saved → %s", html_path)
-    return ReportResult(report_path=html_path, slug=slug)
+    return ReportResult(report_path=html_path, slug=slug, markdown_content=markdown_content)
 
 
 def cleanup_session(session_dir: Path, result: ReportResult) -> Path:

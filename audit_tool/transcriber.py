@@ -317,7 +317,9 @@ def transcribe(
                 "-f", str(converted_path),
                 "--output-txt",
                 "--print-progress",
-                "--gpu",          # enable Metal GPU on Apple Silicon (no-op on Intel)
+                # Metal GPU is enabled by default in the Homebrew ARM64 build.
+                # Use --threads tuned to half the CPU count to avoid contention
+                # between the CPU and the Metal shader dispatch queue.
                 "--threads", str(cpu_threads),
             ],
             capture_output=True,

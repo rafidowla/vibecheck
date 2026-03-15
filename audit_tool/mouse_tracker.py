@@ -49,6 +49,8 @@ from pynput import mouse
 
 from audit_tool.config import (
     CLICK_MARKER_COLOR,
+    CLICK_MARKER_DOT,
+    CLICK_MARKER_HALO,
     CLICK_MARKER_RADIUS,
     CLICK_MARKER_WIDTH,
     SCREENSHOT_QUALITY,
@@ -300,34 +302,55 @@ class MouseTracker:
         # visual size regardless of DPI.
         scaled_radius = int(CLICK_MARKER_RADIUS * scale_x)
         scaled_width = max(1, int(CLICK_MARKER_WIDTH * scale_x))
-        color = CLICK_MARKER_COLOR
-
-        # Draw marker
+        # ── Multi-layer high-contrast marker ──
+        # Layer 1: white halo ring  (always visible against dark backgrounds)
+        # Layer 2: vivid red ring   (primary indicator)
+        # Layer 3: yellow dot       (exact click point, visible on any colour)
+        # Layer 4: crosshairs       (white halo + red line for contrast both ways)
         draw = ImageDraw.Draw(img)
+        halo_gap = max(2, scaled_width)  # separation between halo and main ring
 
-        # Outer circle
+        # Layer 1 — white halo (slightly larger radius)
+        halo_r = scaled_radius + halo_gap
         draw.ellipse(
-            [
-                local_x - scaled_radius,
-                local_y - scaled_radius,
-                local_x + scaled_radius,
-                local_y + scaled_radius,
-            ],
-            outline=color,
+            [local_x - halo_r, local_y - halo_r,
+             local_x + halo_r, local_y + halo_r],
+            outline=CLICK_MARKER_HALO,
+            width=max(2, scaled_width - 1),
+        )
+
+        # Layer 2 — vivid red ring
+        draw.ellipse(
+            [local_x - scaled_radius, local_y - scaled_radius,
+             local_x + scaled_radius, local_y + scaled_radius],
+            outline=CLICK_MARKER_COLOR,
             width=scaled_width,
         )
 
-        # Inner crosshair
+        # Layer 3 — crosshair: white halo pass first, red pass second
         cross_len = scaled_radius + int(8 * scale_x)
-        draw.line(
-            [local_x - cross_len, local_y, local_x + cross_len, local_y],
-            fill=color,
-            width=scaled_width,
-        )
-        draw.line(
-            [local_x, local_y - cross_len, local_x, local_y + cross_len],
-            fill=color,
-            width=scaled_width,
+        halo_w = max(1, scaled_width + 2)
+        for line_color, line_width in [
+            (CLICK_MARKER_HALO, halo_w),
+            (CLICK_MARKER_COLOR, scaled_width),
+        ]:
+            draw.line(
+                [local_x - cross_len, local_y, local_x + cross_len, local_y],
+                fill=line_color, width=line_width,
+            )
+            draw.line(
+                [local_x, local_y - cross_len, local_x, local_y + cross_len],
+                fill=line_color, width=line_width,
+            )
+
+        # Layer 4 — bright yellow centre dot (exact click point)
+        dot_r = max(3, int(5 * scale_x))
+        draw.ellipse(
+            [local_x - dot_r, local_y - dot_r,
+             local_x + dot_r, local_y + dot_r],
+            fill=CLICK_MARKER_DOT,
+            outline=CLICK_MARKER_COLOR,
+            width=1,
         )
 
         logger.debug(

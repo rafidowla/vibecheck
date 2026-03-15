@@ -94,8 +94,10 @@ AUDIO_CHANNELS: int = 1  # mono
 # ---------------------------------------------------------------------------
 SCREENSHOT_QUALITY: int = 85  # JPEG quality for annotated screenshots
 CLICK_MARKER_RADIUS: int = 22  # radius of the highlight circle (px)
-CLICK_MARKER_COLOR: str = "#FF2D2D"  # vivid red
-CLICK_MARKER_WIDTH: int = 3  # stroke width of the circle
+CLICK_MARKER_COLOR: str = "#FF2D2D"   # vivid red — primary ring colour
+CLICK_MARKER_HALO: str = "#FFFFFF"    # white halo behind the ring for contrast
+CLICK_MARKER_DOT: str = "#FFFF00"    # bright yellow centre dot, visible on any bg
+CLICK_MARKER_WIDTH: int = 4           # stroke width of the circle
 
 # ---------------------------------------------------------------------------
 # Output directory

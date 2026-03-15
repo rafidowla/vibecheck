@@ -969,14 +969,7 @@ class AuditRecorderApp:
             self._set_status_threadsafe(
                 f"✅  Report saved: {final_report.name}{cost_str}{jira_str}"
             )
-            # Show completion dialog from main thread, passing the result
-            # and the snapshot of clicks needed for on-demand Jira push.
-            self._root.after(
-                0,
-                lambda r=result, p=final_report, c=clicks_snapshot: (
-                    self._show_completion_dialog(r, p, c)
-                ),
-            )
+            self._root.after(0, lambda p=final_report: self._open_file(p))
 
         except Exception as processing_error:
             logger.exception("Session processing failed")

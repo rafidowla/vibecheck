@@ -251,50 +251,89 @@ class MouseTracker:
     def _capture_and_annotate(self, click_x: int, click_y: int) -> Path:
         """Capture a screenshot, draw a click marker, and save.
 
+        On HiDPI / Retina displays, ``pynput`` reports logical-point coordinates
+        while ``mss`` captures at physical-pixel resolution (typically 2× on
+        Apple Silicon / Retina).  This method derives the physical-to-logical
+        scale factor from the ratio of the raw capture dimensions to the logical
+        monitor dimensions reported by ``mss``.  No platform-specific branches
+        are needed — on standard 1× displays the scale factors equal 1.0.
+
         Args:
-            click_x: Absolute X position of the click.
-            click_y: Absolute Y position of the click.
+            click_x: Absolute X position of the click in *logical* screen points.
+            click_y: Absolute Y position of the click in *logical* screen points.
 
         Returns:
             Path to the saved annotated PNG.
+
+        Side Effects:
+            Writes a PNG file to the session directory.
         """
         assert self._sct is not None
         assert self._session_dir is not None
 
         monitor = self._sct.monitors[self._monitor_index]
 
-        # Capture the raw screenshot
+        # Capture the raw screenshot (dimensions are in physical pixels).
         raw = self._sct.grab(monitor)
         img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
 
-        # Translate absolute screen coords → image-local coords
-        local_x = click_x - monitor["left"]
-        local_y = click_y - monitor["top"]
+        # Compute scale factors: physical pixels per logical point.
+        # On Retina/HiDPI this is typically 2.0; on standard displays it is 1.0.
+        # raw.size contains (physical_width, physical_height).
+        # monitor["width"]/monitor["height"] are in logical points.
+        logical_width: int = monitor["width"]
+        logical_height: int = monitor["height"]
+        physical_width, physical_height = raw.size
 
-        # Draw the click marker
-        draw = ImageDraw.Draw(img)
-        radius = CLICK_MARKER_RADIUS
-        width = CLICK_MARKER_WIDTH
+        scale_x: float = physical_width / logical_width if logical_width > 0 else 1.0
+        scale_y: float = physical_height / logical_height if logical_height > 0 else 1.0
+
+        # Translate absolute logical coords → physical pixel coords within the image.
+        local_x = int((click_x - monitor["left"]) * scale_x)
+        local_y = int((click_y - monitor["top"]) * scale_y)
+
+        # Clamp to image bounds to prevent drawing outside the canvas.
+        local_x = max(0, min(local_x, physical_width - 1))
+        local_y = max(0, min(local_y, physical_height - 1))
+
+        # Scale the marker radius/width proportionally so it looks the same
+        # visual size regardless of DPI.
+        scaled_radius = int(CLICK_MARKER_RADIUS * scale_x)
+        scaled_width = max(1, int(CLICK_MARKER_WIDTH * scale_x))
         color = CLICK_MARKER_COLOR
+
+        # Draw marker
+        draw = ImageDraw.Draw(img)
 
         # Outer circle
         draw.ellipse(
-            [local_x - radius, local_y - radius, local_x + radius, local_y + radius],
+            [
+                local_x - scaled_radius,
+                local_y - scaled_radius,
+                local_x + scaled_radius,
+                local_y + scaled_radius,
+            ],
             outline=color,
-            width=width,
+            width=scaled_width,
         )
 
         # Inner crosshair
-        cross_len = radius + 8
+        cross_len = scaled_radius + int(8 * scale_x)
         draw.line(
             [local_x - cross_len, local_y, local_x + cross_len, local_y],
             fill=color,
-            width=width,
+            width=scaled_width,
         )
         draw.line(
             [local_x, local_y - cross_len, local_x, local_y + cross_len],
             fill=color,
-            width=width,
+            width=scaled_width,
+        )
+
+        logger.debug(
+            "Click marker drawn at physical (%d, %d) from logical (%d, %d) "
+            "with scale (%.1f×, %.1f×)",
+            local_x, local_y, click_x, click_y, scale_x, scale_y,
         )
 
         # Save

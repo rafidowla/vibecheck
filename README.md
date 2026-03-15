@@ -80,6 +80,48 @@ WHISPER_MODEL=medium-q5
 python -m audit_tool.main
 ```
 
+## 💡 Process Modes
+
+Select a mode before recording in the VibeCheck GUI:
+
+| Mode | Icon | What it Produces |
+|------|------|------------------|
+| **QA Review** | 🔍 | Structured bug/task list — one task per finding with priority, implementation steps, and acceptance criteria. Ready for AI coding agents (Claude Code, Antigravity, Cursor) and Jira. |
+| **Documentation** | 📖 | Step-by-step SOP / tutorial guide — each click becomes a numbered step with instructional language ("Click the…", "Enter your…"). Ideal for user manuals, onboarding docs, and knowledge bases. |
+
+---
+
+## 🔗 Jira Integration (Optional)
+
+VibeCheck can automatically push the generated output into Jira Cloud after each session.
+
+### Setup
+
+1. Generate a [Jira API token](https://id.atlassian.com/manage-profile/security/api-tokens).
+2. Add the following to your `.env`:
+
+```env
+JIRA_BASE_URL=https://yourorg.atlassian.net
+JIRA_EMAIL=you@yourorg.com
+JIRA_API_TOKEN=your-api-token-here
+JIRA_PROJECT_KEY=PROJ
+# JIRA_ISSUE_TYPE=Task   # optional, defaults to Task
+```
+
+### Behaviour by Mode
+
+| Mode | Jira Output |
+|------|-------------|
+| **QA Review** | One Jira issue per task, with the relevant screenshot attached to each. |
+| **Documentation** | A single Jira issue containing the full guide with all screenshots attached. |
+
+- Issues are labelled `vibecheck` + mode (`qa` or `documentation`).
+- Priority is detected automatically from the AI output (`Critical → Highest`, `High`, `Medium`, `Low`).
+- Created issue keys appear in the status bar: `✅ Report saved: … • Jira: PROJ-12, PROJ-13`.
+- If Jira is unconfigured, all Jira steps are silently skipped.
+
+---
+
 ## 🎙️ Whisper Model Options
 
 Choose per-session when you click **Stop & Generate**:

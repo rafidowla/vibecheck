@@ -52,7 +52,7 @@ import mss
 from PIL import Image, ImageTk
 
 from audit_tool.audio_recorder import AudioRecorder
-from audit_tool.config import create_session_dir, OPENROUTER_API_KEY
+from audit_tool.config import create_session_dir, OPENROUTER_API_KEY, ProcessMode
 from audit_tool.mouse_tracker import ClickRecord, MouseTracker
 from audit_tool.report_generator import generate_report, cleanup_session, ReportResult
 from audit_tool.transcriber import transcribe, WHISPER_MODELS, WHISPER_MODEL_SIZE
@@ -222,6 +222,31 @@ class StyledButton(tk.Frame):
         return f"#{r:02x}{g:02x}{b:02x}"
 
 
+def _all_children(widget: tk.Widget) -> list[tk.Widget]:
+    """Recursively collect all descendant widgets of a Tkinter widget.
+
+    Purpose:
+        Used to bind click events to every child widget inside a compound
+        card frame so the click is detected regardless of which sub-element
+        the user actually hits.
+
+    Args:
+        widget: The root widget whose descendants should be collected.
+
+    Returns:
+        Flat list of all descendant ``tk.Widget`` instances (depth-first).
+
+    Determinism: Deterministic.
+    Idempotency: Yes.
+    Thread Safety: Must be called from the main Tkinter thread.
+    """
+    children: list[tk.Widget] = []
+    for child in widget.winfo_children():
+        children.append(child)
+        children.extend(_all_children(child))
+    return children
+
+
 class AuditRecorderApp:
     """Main application class — Tkinter GUI controller.
 
@@ -250,6 +275,7 @@ class AuditRecorderApp:
         self._pause_start: Optional[float] = None
         self._timer_id: Optional[str] = None
         self._selected_monitor: int = 1
+        self._process_mode: ProcessMode = ProcessMode.QA
 
         # Monitor thumbnails
         self._monitor_photos: list[ImageTk.PhotoImage] = []
@@ -296,6 +322,33 @@ class AuditRecorderApp:
         # ── Separator ──
         sep = tk.Frame(root, bg=BORDER, height=1)
         sep.pack(fill="x", padx=24, pady=(14, 10))
+
+        # ── Process Mode selector ──
+        tk.Label(
+            root,
+            text="PROCESS MODE",
+            font=(FONT, 9, "bold"),
+            fg=FG_DIM,
+            bg=BG,
+        ).pack(anchor="w", padx=26, pady=(0, 6))
+
+        mode_frame = tk.Frame(root, bg=BG)
+        mode_frame.pack(fill="x", padx=24, pady=(0, 12))
+
+        self._mode_buttons: dict[ProcessMode, tk.Frame] = {}
+        mode_definitions = [
+            (ProcessMode.QA, "QA Review", "🔍", "Bug / task list for AI agents & Jira"),
+            (ProcessMode.DOCUMENTATION, "Documentation", "📖", "SOP / how-to tutorial guide"),
+        ]
+        for mode_value, mode_label, mode_emoji, mode_desc in mode_definitions:
+            card = self._create_mode_card(
+                mode_frame, mode_value, mode_emoji, mode_label, mode_desc
+            )
+            card.pack(side="left", padx=(0, 8), fill="both", expand=True)
+            self._mode_buttons[mode_value] = card
+
+        # Auto-select QA mode
+        self._select_mode(ProcessMode.QA)
 
         # ── Monitor label ──
         tk.Label(
@@ -384,6 +437,105 @@ class AuditRecorderApp:
             anchor="e",
         )
         self._timer_label.pack(side="right", padx=(0, 24))
+
+    # ------------------------------------------------------------------
+    # Mode selector cards
+    # ------------------------------------------------------------------
+
+    def _create_mode_card(
+        self,
+        parent: tk.Frame,
+        mode: ProcessMode,
+        emoji: str,
+        label: str,
+        description: str,
+    ) -> tk.Frame:
+        """Build a clickable process-mode selection card.
+
+        Args:
+            parent: Parent frame.
+            mode: The ``ProcessMode`` value this card represents.
+            emoji: Emoji icon shown on the card.
+            label: Short display name.
+            description: One-line description shown beneath the label.
+
+        Returns:
+            The card Frame widget.
+        """
+        card = tk.Frame(
+            parent,
+            bg=BG_CARD,
+            highlightbackground=BORDER,
+            highlightthickness=2,
+            cursor="hand2",
+            padx=12,
+            pady=10,
+        )
+
+        header = tk.Frame(card, bg=BG_CARD, cursor="hand2")
+        header.pack(fill="x")
+
+        tk.Label(
+            header,
+            text=emoji,
+            font=(FONT, 16),
+            bg=BG_CARD,
+            cursor="hand2",
+        ).pack(side="left", padx=(0, 6))
+
+        tk.Label(
+            header,
+            text=label,
+            font=(FONT, 11, "bold"),
+            fg=FG,
+            bg=BG_CARD,
+            cursor="hand2",
+        ).pack(side="left")
+
+        tk.Label(
+            card,
+            text=description,
+            font=(FONT, 9),
+            fg=FG_DIM,
+            bg=BG_CARD,
+            cursor="hand2",
+            wraplength=160,
+            justify="left",
+        ).pack(fill="x", pady=(4, 0))
+
+        # Bind click to card and all its children
+        for widget in _all_children(card):
+            widget.bind("<Button-1>", lambda e, m=mode: self._select_mode(m))
+        card.bind("<Button-1>", lambda e, m=mode: self._select_mode(m))
+
+        return card
+
+    def _select_mode(self, mode: ProcessMode) -> None:
+        """Highlight the selected mode card and update internal state.
+
+        Args:
+            mode: The ``ProcessMode`` to activate.
+
+        Side Effects:
+            Updates card border highlights and background colours.
+            Sets ``self._process_mode``.
+        """
+        self._process_mode = mode
+
+        for card_mode, card in self._mode_buttons.items():
+            selected = card_mode == mode
+            border_color = BORDER_SELECTED if selected else BORDER
+            bg_color = BG_CARD_SELECTED if selected else BG_CARD
+            card.configure(
+                highlightbackground=border_color,
+                highlightthickness=2,
+                bg=bg_color,
+            )
+            for child in _all_children(card):
+                try:
+                    child.configure(bg=bg_color)
+                except tk.TclError:
+                    pass  # Some widgets don't support bg re-config
 
     # ------------------------------------------------------------------
     # Monitor cards
@@ -764,11 +916,13 @@ class AuditRecorderApp:
             segments = transcribe(wav_path, model_size=model_size)
             self._set_status_threadsafe(
                 f"⏳  Generating report ({len(segments)} segments, "
-                f"{len(clicks)} clicks)…"
+                f"{len(clicks)} clicks, mode: {self._process_mode.value})…"
             )
 
             assert self._session_dir is not None
-            result = generate_report(self._session_dir, segments, clicks)
+            result = generate_report(
+                self._session_dir, segments, clicks, mode=self._process_mode
+            )
 
             # Release large objects now that reports are written
             del segments, clicks
@@ -781,8 +935,13 @@ class AuditRecorderApp:
             final_report = final_dir / result.report_path.name
 
             cost_str = f"  •  AI cost: {result.cost_display}" if result.cost_usd else ""
+            jira_str = (
+                f"  •  Jira: {', '.join(result.jira_keys)}"
+                if result.jira_keys
+                else ""
+            )
             self._set_status_threadsafe(
-                f"✅  Report saved: {final_report.name}{cost_str}"
+                f"✅  Report saved: {final_report.name}{cost_str}{jira_str}"
             )
             self._open_file(final_report)
 

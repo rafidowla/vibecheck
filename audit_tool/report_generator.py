@@ -36,7 +36,7 @@ import logging
 import re
 import shutil
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Tuple
@@ -47,9 +47,11 @@ from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 from audit_tool.config import (
+    JIRA_CONFIG,
     OPENROUTER_API_KEY,
     OPENROUTER_BASE_URL,
     OPENROUTER_MODEL,
+    ProcessMode,
 )
 from audit_tool.transcriber import TranscriptSegment
 
@@ -65,7 +67,7 @@ _COST_PER_1M_OUTPUT_TOKENS: float = 0.40
 
 @dataclass
 class ReportResult:
-    """Result of report generation, including cost metrics.
+    """Result of report generation, including cost metrics and Jira keys.
 
     Attributes:
         report_path: Absolute path to the primary HTML report.
@@ -74,6 +76,7 @@ class ReportResult:
         input_tokens: Number of input tokens consumed.
         output_tokens: Number of output tokens produced.
         cost_usd: Estimated cost in US dollars.
+        jira_keys: List of Jira issue keys created (empty if Jira unconfigured).
     """
 
     report_path: Path
@@ -82,6 +85,7 @@ class ReportResult:
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: float = 0.0
+    jira_keys: list[str] = field(default_factory=list)
 
     @property
     def cost_display(self) -> str:
@@ -100,27 +104,33 @@ def generate_report(
     session_dir: Path,
     transcript: list[TranscriptSegment],
     clicks: list[ClickRecord],
+    mode: ProcessMode = ProcessMode.QA,
 ) -> ReportResult:
     """Generate a structured feedback document from a recording session.
 
     Pipeline:
       1. Move all ``click_*.png`` screenshots into ``session_dir/img/``.
-      2. Call the AI model (or fall back to template).
+      2. Call the AI model with the appropriate mode prompt (or fall back).
       3. Write ``<slug>.html`` with relative ``img/`` references.
-      4. Write ``<slug>.docx`` with screenshots inlined within each task.
+      4. Write ``<slug>.docx`` with screenshots inlined within each task/step.
       5. Write ``<slug>.md`` for pasting into an IDE.
+      6. If Jira is configured, push tasks/steps as individual issues.
 
     Args:
         session_dir: Session output directory (may have temp name).
         transcript: Timestamped transcript segments from Whisper.
         clicks: Click records with annotated screenshot paths.
+        mode: ``ProcessMode.QA`` (default) → bug/task list for AI agents;
+              ``ProcessMode.DOCUMENTATION`` → SOP/tutorial document.
 
     Returns:
-        ``ReportResult`` containing the report path, slug, and AI cost.
+        ``ReportResult`` containing the report path, slug, AI cost, and any
+        Jira issue keys created.
 
     Side Effects:
         - Creates ``img/`` subdirectory and moves PNGs into it.
         - HTTP POST to OpenRouter (if key available).
+        - HTTP POSTs to Jira (if JIRA_CONFIG is set).
         - Writes report files to ``session_dir``.
     """
     # ── Step 1: Move screenshots into img/ ──
@@ -138,7 +148,7 @@ def generate_report(
     # ── Step 4: Generate content ──
     if OPENROUTER_API_KEY:
         try:
-            markdown_content, usage = _generate_via_api(transcript, clicks)
+            markdown_content, usage = _generate_via_api(transcript, clicks, mode)
 
             input_tokens = usage.get("prompt_tokens", 0)
             output_tokens = usage.get("completion_tokens", 0)
@@ -158,6 +168,16 @@ def generate_report(
             html_path.write_text(html_content, encoding="utf-8")
             _build_docx_report(docx_path, markdown_content, transcript, clicks)
 
+            # ── Step 5: Optional Jira push ──
+            jira_keys: list[str] = []
+            if JIRA_CONFIG is not None:
+                try:
+                    jira_keys = push_to_jira(
+                        JIRA_CONFIG, markdown_content, clicks, mode
+                    )
+                except Exception as jira_error:
+                    logger.error("Jira push failed: %s", jira_error)
+
             logger.info("AI report saved → %s (cost: $%.4f)", html_path, cost_usd)
             return ReportResult(
                 report_path=html_path,
@@ -166,12 +186,13 @@ def generate_report(
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 cost_usd=cost_usd,
+                jira_keys=jira_keys,
             )
         except Exception:
             logger.exception("OpenRouter API failed — falling back to template.")
 
-    # Fallback: template-based report
-    markdown_content = _generate_template_report(transcript, clicks)
+    # ── Fallback: template-based report ──
+    markdown_content = _generate_template_report(transcript, clicks, mode)
     slug = _extract_slug_from_transcript(transcript)
     if slug:
         md_path = session_dir / f"{slug}.md"
@@ -470,8 +491,14 @@ def _extract_img_reference(
 def _generate_via_api(
     transcript: list[TranscriptSegment],
     clicks: list,
+    mode: ProcessMode = ProcessMode.QA,
 ) -> Tuple[str, dict]:
     """Call the OpenRouter chat completions endpoint with vision.
+
+    Args:
+        transcript: Timestamped speech segments.
+        clicks: Click records with screenshot paths.
+        mode: Process mode that selects the system prompt.
 
     Returns:
         A tuple of (markdown_content, usage_dict).
@@ -482,10 +509,15 @@ def _generate_via_api(
     """
     transcript_text = _format_transcript(transcript)
 
+    if mode == ProcessMode.DOCUMENTATION:
+        prompt_text = _build_documentation_prompt(transcript_text, clicks)
+    else:
+        prompt_text = _build_qa_prompt(transcript_text, clicks)
+
     content: list[dict[str, Any]] = [
         {
             "type": "text",
-            "text": _build_system_prompt(transcript_text, clicks),
+            "text": prompt_text,
         }
     ]
 
@@ -541,11 +573,25 @@ def _generate_via_api(
     return markdown_text, usage
 
 
-def _build_system_prompt(
+def _build_qa_prompt(
     transcript_text: str,
     clicks: list,
 ) -> str:
-    """Build the instruction prompt for the vision model."""
+    """Build the QA mode system prompt for the vision model.
+
+    Purpose:
+        Generates a structured bug/task list optimised for AI coding agents
+        (Claude Code, Cursor, Antigravity) and Jira tickets.  Each finding
+        becomes an independently actionable task with implementation steps,
+        acceptance criteria, and a screenshot reference.
+
+    Args:
+        transcript_text: Pre-formatted timestamped transcript.
+        clicks: Click records (for position summary).
+
+    Returns:
+        Prompt string to send as the user message content.
+    """
     click_summary = "\n".join(
         f"  - Click #{c.index}: ({c.x}, {c.y}) at {_epoch_to_time(c.timestamp)}"
         for c in clicks
@@ -604,10 +650,88 @@ Produce a Markdown document with this EXACT structure:
 10. Number the tasks sequentially (Task 1, Task 2, etc).
 """
 
+def _build_documentation_prompt(
+    transcript_text: str,
+    clicks: list,
+) -> str:
+    """Build the Documentation mode system prompt for the vision model.
 
-# -----------------------------------------------------------------------
-# HTML generation — uses relative img/ paths (NOT base64)
-# -----------------------------------------------------------------------
+    Purpose:
+        Generates an instructional SOP (Standard Operating Procedure) or
+        tutorial document.  Each screenshot + spoken narration becomes a
+        numbered step in a how-to guide.  Language is instructional
+        ("Click the…", "Enter your…") rather than bug/fix oriented.
+
+    Args:
+        transcript_text: Pre-formatted timestamped transcript.
+        clicks: Click records (for step-by-step pairing).
+
+    Returns:
+        Prompt string to send as the user message content.
+    """
+    click_summary = "\n".join(
+        f"  - Step screenshot #{c.index}: ({c.x}, {c.y}) at {_epoch_to_time(c.timestamp)}"
+        for c in clicks
+    )
+
+    return f"""You are a senior technical writer. I recorded a walkthrough of an application while narrating what I was doing. The screenshots show each screen I visited; the red crosshair marks exactly where I clicked.
+
+Your job: transform my narration and screenshots into a **clear, polished tutorial or SOP (Standard Operating Procedure)** that a new user can follow step by step. This is NOT a bug report — it is a how-to guide.
+
+## My Narration (timestamped)
+{transcript_text}
+
+## Screenshot Sequence
+{click_summary if click_summary else "  (no screenshots recorded)"}
+
+## Output Format
+
+Produce a Markdown document with this EXACT structure:
+
+```
+# [Application / Feature Name] — How-To Guide
+
+## Overview
+2-3 sentences summarising what this guide covers and who it is for.
+
+## Prerequisites
+- [Any account, permission, or setup requirement — or write "None" if not applicable]
+
+## Step-by-Step Walkthrough
+
+### Step 1: [Action title, e.g. "Log in to the dashboard"]
+**Screenshot:** click_NNNN.png
+
+Describe exactly what the user sees on this screen and what they should do.
+Use instructional language: "Click the **Sign In** button in the top-right corner", "Enter your email address in the **Email** field", etc.
+
+> 💡 **Tip:** [Optional contextual tip, shortcut, or common mistake to avoid]
+
+### Step 2: [Next action]
+...
+
+## Notes & Tips
+- [Any important warnings, edge cases, or best practices for this workflow]
+
+## Acceptance Checklist
+- [ ] [Specific, testable condition confirming the user completed the workflow]
+- [ ] [Another condition if needed]
+```
+
+## Critical Rules
+1. Pair each numbered step with its corresponding screenshot (click_NNNN.png).
+2. Use the RED CROSSHAIR in the screenshot to identify exactly what was clicked — describe that element precisely (button label, field name, menu item).
+3. Write in second person ("you", "your") — never "I" or "the user".
+4. Steps must be short, scannable, and action-oriented. No multi-paragraph essays per step.
+5. Infer the application name and feature context from what is visible on screen.
+6. If a screenshot shows an intermediate loading or confirmation state, still describe it — these are important orientation points for the reader.
+7. The **Acceptance Checklist** at the end should verify that the full workflow was completed successfully, not just individual steps.
+8. Include a **Notes & Tips** section that captures any verbal caveats I mentioned or pitfalls visible in the screenshots.
+9. Output ONLY the Markdown document. No preamble, no explanation, no commentary.
+10. Number steps sequentially.
+"""
+
+
 
 _HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
@@ -748,8 +872,19 @@ def _markdown_to_simple_html(md_text: str) -> str:
 def _generate_template_report(
     transcript: list[TranscriptSegment],
     clicks: list,
+    mode: ProcessMode = ProcessMode.QA,
 ) -> str:
-    """Build a structured Markdown report without an LLM."""
+    """Build a structured Markdown report without an LLM.
+
+    Args:
+        transcript: Timestamped speech segments.
+        clicks: Click records.
+        mode: Process mode, used to tailor the template header and task list
+            labels (QA vs Documentation).
+
+    Returns:
+        A Markdown string ready to write to disk.
+    """
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     transcript_text = _format_transcript(transcript)
 
@@ -761,22 +896,31 @@ def _generate_template_report(
             f"- **Screenshot:** `{click.screenshot_path.name}`\n\n"
         )
 
-    return f"""# QA Review — Session {now}
+    if mode == ProcessMode.DOCUMENTATION:
+        header = f"# Documentation Session — {now}"
+        task_label = "## Steps (fill in manually)"
+        task_placeholder = "- [ ] Step 1: "
+    else:
+        header = f"# QA Review — Session {now}"
+        task_label = "## Task List (fill in manually)"
+        task_placeholder = "- [ ] "
+
+    return f"""{header}
 
 > **Note:** This report was generated offline (no AI API key configured).
-> Review the transcript and screenshots below to create your task list.
+> Review the transcript and screenshots below to complete this document.
 
 ## Transcript
 
 {transcript_text if transcript_text.strip() else "_No speech was recorded._"}
 
-## Click Log
+## Click / Screenshot Log
 
 {click_section if click_section.strip() else "_No clicks were recorded._"}
 
-## Task List (fill in manually)
+{task_label}
 
-- [ ] 
+{task_placeholder}
 """
 
 
@@ -873,13 +1017,23 @@ def _slugify(text: str, max_length: int = 50) -> str:
 
 
 def _extract_slug(markdown_text: str) -> str:
-    """Extract a descriptive slug from the AI-generated Markdown title."""
+    """Extract a descriptive slug from the AI-generated Markdown title.
+
+    Handles both QA mode (e.g. ``# App — QA Tasks``) and Documentation
+    mode (e.g. ``# Feature — How-To Guide``) title suffixes.
+    """
     for line in markdown_text.split("\n"):
         stripped = line.strip()
         if stripped.startswith("# "):
             title = stripped.lstrip("# ").strip()
-            for suffix in ["— QA Tasks", "- QA Tasks", ": QA Tasks",
-                           "— Audit Tasks", "- Audit Tasks", ": Audit Tasks"]:
+            for suffix in [
+                "— QA Tasks", "- QA Tasks", ": QA Tasks",
+                "— Audit Tasks", "- Audit Tasks", ": Audit Tasks",
+                "— How-To Guide", "- How-To Guide", ": How-To Guide",
+                "— Tutorial", "- Tutorial", ": Tutorial",
+                "— SOP", "- SOP", ": SOP",
+                "— Documentation", "- Documentation",
+            ]:
                 if title.lower().endswith(suffix.lower()):
                     title = title[: -len(suffix)].strip()
                     break
@@ -888,12 +1042,17 @@ def _extract_slug(markdown_text: str) -> str:
                 "Audit Tasks —", "Audit Tasks -",
                 "QA Review —", "QA Review -",
                 "VibeCheck —", "VibeCheck -",
+                "How-To Guide —", "How-To Guide -",
+                "Tutorial —", "Tutorial -",
             ]:
                 if title.lower().startswith(prefix.lower()):
-                    title = title[len(prefix) :].strip()
+                    title = title[len(prefix):].strip()
                     break
             slug = _slugify(title)
-            if slug and slug not in ("audit-feedback", "audit-tasks", "qa-review", "vibecheck"):
+            if slug and slug not in (
+                "audit-feedback", "audit-tasks", "qa-review",
+                "vibecheck", "how-to-guide", "tutorial",
+            ):
                 return slug
     return ""
 
@@ -945,6 +1104,140 @@ def _rename_session_dir(session_dir: Path, slug: str) -> Path:
         logger.warning("Could not rename session dir: %s", err)
         return session_dir
 
+# -----------------------------------------------------------------------
+# Jira integration
+# -----------------------------------------------------------------------
+
+
+def push_to_jira(
+    config: "JiraConfig",  # type: ignore[name-defined]
+    markdown_content: str,
+    clicks: list,
+    mode: ProcessMode,
+) -> list[str]:
+    """Parse a generated Markdown report and push each task/step to Jira.
+
+    Purpose:
+        For QA mode, extracts each ``### Task N:`` block from the Markdown and
+        creates one Jira issue per task.  For Documentation mode, creates a
+        single Jira issue with the entire guide as its description.
+
+        Screenshot attachments are matched by scanning each block for
+        ``click_NNNN.png`` references.
+
+    Args:
+        config: Populated ``JiraConfig`` from ``audit_tool.config``.
+        markdown_content: The full AI-generated Markdown string.
+        clicks: Click records (used to resolve screenshot paths).
+        mode: Process mode — determines parsing strategy.
+
+    Returns:
+        List of created Jira issue keys, in order.
+
+    Side Effects:
+        HTTP calls to the Jira instance (delegated to ``jira_client``).
+
+    Error Behavior:
+        Errors from ``jira_client`` are propagated to the caller in
+        ``generate_report``, which catches and logs them without crashing.
+
+    Determinism: Nondeterministic.
+    Idempotency: No.
+    Thread Safety: Yes.
+    """
+    from audit_tool.jira_client import JiraIssuePayload, push_session_to_jira
+
+    # Build a screenshot path lookup: filename → Path
+    screenshot_lookup: dict[str, Path] = {
+        click.screenshot_path.name: click.screenshot_path
+        for click in clicks
+        if click.screenshot_path.exists()
+    }
+
+    payloads: list[JiraIssuePayload] = []
+
+    if mode == ProcessMode.DOCUMENTATION:
+        # Single issue: the whole guide
+        payloads.append(JiraIssuePayload(
+            summary="Documentation: " + _extract_doc_title(markdown_content),
+            description_markdown=markdown_content,
+            labels=["vibecheck", "documentation"],
+            priority="Medium",
+            attachments=list(screenshot_lookup.values()),
+            task_number=0,
+        ))
+    else:
+        # QA mode: one issue per ### Task N block
+        payloads = _parse_qa_tasks_to_payloads(markdown_content, screenshot_lookup)
+
+    return push_session_to_jira(config, payloads)
+
+
+def _extract_doc_title(markdown_text: str) -> str:
+    """Extract the H1 title from a Markdown string, or return a fallback."""
+    for line in markdown_text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("# "):
+            return stripped.lstrip("# ").strip()[:200]
+    return "Walkthrough"
+
+
+def _parse_qa_tasks_to_payloads(
+    markdown_text: str,
+    screenshot_lookup: dict[str, Path],
+) -> list["JiraIssuePayload"]:
+    """Split a QA-mode Markdown report into per-task ``JiraIssuePayload`` objects.
+
+    Args:
+        markdown_text: Full AI-generated Markdown.
+        screenshot_lookup: Filename → Path for all captured screenshots.
+
+    Returns:
+        One ``JiraIssuePayload`` per detected ``### Task N`` block.
+    """
+    from audit_tool.jira_client import JiraIssuePayload
+
+    # Split on ### Task headers
+    task_pattern = re.compile(r"^### Task \d+[:\s]", re.MULTILINE)
+    splits = task_pattern.split(markdown_text)
+    headers = task_pattern.findall(markdown_text)
+
+    payloads: list[JiraIssuePayload] = []
+
+    for task_number, (header, body) in enumerate(zip(headers, splits[1:]), start=1):
+        raw_title = header.strip().removeprefix("### Task ").strip()
+        # Remove leading "1: " or "1 " numeric prefix
+        raw_title = re.sub(r"^\d+[:\s]+", "", raw_title).strip()
+        summary = f"[QA] {raw_title}" if raw_title else f"[QA] Task {task_number}"
+
+        # Detect priority from body
+        priority = "Medium"
+        priority_match = re.search(
+            r"Priority:\s*(Critical|High|Medium|Low)", body, re.IGNORECASE
+        )
+        if priority_match:
+            raw_priority = priority_match.group(1).capitalize()
+            # Jira doesn't have "Critical" by default; map to "Highest"
+            priority = "Highest" if raw_priority == "Critical" else raw_priority
+
+        # Find screenshot references in this block
+        attachments: list[Path] = []
+        for fname, fpath in screenshot_lookup.items():
+            if fname in body:
+                attachments.append(fpath)
+
+        payloads.append(JiraIssuePayload(
+            summary=summary[:255],
+            description_markdown=body.strip(),
+            labels=["vibecheck", "qa"],
+            priority=priority,
+            attachments=attachments,
+            task_number=task_number,
+        ))
+
+    return payloads
+
 
 # Needed for type references when ClickRecord hasn't been imported yet
 from audit_tool.mouse_tracker import ClickRecord  # noqa: E402
+from audit_tool.config import JiraConfig  # noqa: E402

@@ -406,9 +406,35 @@ class AuditRecorderApp:
         self._cancel_btn.set_enabled(False)
 
         # ── Status bar ──
+        # IMPORTANT: In Tkinter, side='right' widgets MUST be packed before
+        # side='left' fill widgets, otherwise the fill widget consumes all
+        # remaining space and the right-side widgets are clipped.
         status_frame = tk.Frame(root, bg="#08080c")
         status_frame.pack(fill="x", side="bottom", ipady=8)
 
+        # Pack right-side widgets first
+        self._timer_label = tk.Label(
+            status_frame,
+            text="",
+            font=("Courier", 13, "bold"),
+            fg=ACCENT,
+            bg="#08080c",
+            anchor="e",
+            width=6,   # fixed width prevents clipping (format: MM:SS)
+        )
+        self._timer_label.pack(side="right", padx=(0, 20))
+
+        self._click_count_label = tk.Label(
+            status_frame,
+            text="",
+            font=(FONT, 10),
+            fg=FG_DIM,
+            bg="#08080c",
+            width=12,  # fixed width: "📸 NNN clicks"
+        )
+        self._click_count_label.pack(side="right", padx=(0, 4))
+
+        # Status label fills remaining space on the left
         self._status_label = tk.Label(
             status_frame,
             text="Ready — select a monitor and press Start",
@@ -417,26 +443,7 @@ class AuditRecorderApp:
             bg="#08080c",
             anchor="w",
         )
-        self._status_label.pack(side="left", padx=24)
-
-        self._click_count_label = tk.Label(
-            status_frame,
-            text="",
-            font=(FONT, 10),
-            fg=FG_DIM,
-            bg="#08080c",
-        )
-        self._click_count_label.pack(side="right", padx=8)
-
-        self._timer_label = tk.Label(
-            status_frame,
-            text="",
-            font=("Courier", 13, "bold"),
-            fg=ACCENT,
-            bg="#08080c",
-            anchor="e",
-        )
-        self._timer_label.pack(side="right", padx=(0, 24))
+        self._status_label.pack(side="left", padx=20, fill="x", expand=True)
 
     # ------------------------------------------------------------------
     # Mode selector cards
@@ -645,19 +652,33 @@ class AuditRecorderApp:
     # ------------------------------------------------------------------
 
     def _center_window(self) -> None:
-        """Centre the window on the primary display."""
+        """Size the window to fit all content, then centre it on the primary display.
+
+        Uses ``winfo_reqheight()`` after ``update_idletasks()`` to measure the
+        true required height so the window auto-expands when new UI sections
+        (e.g. the mode selector) are added, rather than relying on a
+        hardcoded constant that clips content.
+
+        Side Effects:
+            Calls ``self._root.geometry()`` to resize and reposition the window.
+        """
         self._root.update_idletasks()
         num_monitors = len(self._monitors) - 1
         card_width = THUMB_WIDTH + 14
         content_width = max(num_monitors * card_width + 60, 540)
         width = min(content_width, 960)
-        height = 400
-        self._root.geometry(f"{width}x{height}")
+
+        # Let Tkinter measure the actual required height rather than guessing.
+        # Add a small buffer (16 px) to prevent Tkinter from clipping the
+        # status bar's bottom border on some macOS window managers.
+        required_height = self._root.winfo_reqheight()
+        height = max(required_height + 16, 520)  # floor at 520 to look intentional
+
         screen_w = self._root.winfo_screenwidth()
         screen_h = self._root.winfo_screenheight()
         x = (screen_w - width) // 2
         y = (screen_h - height) // 2
-        self._root.geometry(f"+{x}+{y}")
+        self._root.geometry(f"{width}x{height}+{x}+{y}")
 
     # ------------------------------------------------------------------
     # Event handlers

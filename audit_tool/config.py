@@ -74,7 +74,7 @@ class ProcessMode(str, Enum):
 
 OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL: str = os.getenv(
-    "OPENROUTER_MODEL", "qwen/qwen2.5-vl-72b-instruct"
+    "OPENROUTER_MODEL", "google/gemini-2.5-flash"
 )
 OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1/chat/completions"
 

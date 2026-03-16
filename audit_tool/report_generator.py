@@ -575,11 +575,50 @@ def _generate_via_api(
     return markdown_text, usage
 
 
+_PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
+
+
+def _load_prompt(filename: str, transcript_text: str, click_summary: str) -> str:
+    """Load a prompt template from the ``prompts/`` directory and substitute values.
+
+    Purpose:
+        Allows users to customise the AI prompt without editing Python source.
+        Reads ``prompts/<filename>`` and substitutes ``{{TRANSCRIPT}}`` and
+        ``{{CLICKS}}`` placeholders.  Falls back silently to the built-in default
+        string returned by the caller if the file is missing or unreadable.
+
+    Args:
+        filename: Prompt file name, e.g. ``"qa_prompt.md"``.
+        transcript_text: Formatted transcript to inject.
+        click_summary: Formatted click position summary to inject.
+
+    Returns:
+        The rendered prompt string with placeholders substituted.
+        Returns an empty string if the file cannot be read (caller uses default).
+
+    Side Effects:
+        Reads one file from disk.
+    """
+    prompt_path = _PROMPTS_DIR / filename
+    try:
+        template = prompt_path.read_text(encoding="utf-8")
+        rendered = (
+            template
+            .replace("{{TRANSCRIPT}}", transcript_text)
+            .replace("{{CLICKS}}", click_summary)
+        )
+        logger.info("Loaded custom prompt from %s", prompt_path)
+        return rendered
+    except OSError:
+        logger.debug("Prompt file not found: %s — using built-in default.", prompt_path)
+        return ""
+
+
 def _build_qa_prompt(
     transcript_text: str,
     clicks: list,
 ) -> str:
-    """Build the QA mode system prompt for the vision model.
+    """Return the QA mode prompt, preferring the editable file in ``prompts/``.
 
     Purpose:
         Generates a structured bug/task list optimised for AI coding agents
@@ -592,12 +631,36 @@ def _build_qa_prompt(
         clicks: Click records (for position summary).
 
     Returns:
-        Prompt string to send as the user message content.
+        Prompt string to send as the user message content.  Sourced from
+        ``prompts/qa_prompt.md`` if present, otherwise built-in default.
     """
     click_summary = "\n".join(
         f"  - Click #{c.index}: ({c.x}, {c.y}) at {_epoch_to_time(c.timestamp)}"
         for c in clicks
-    )
+    ) or "  (no clicks recorded)"
+
+    # Try file-based prompt first
+    custom = _load_prompt("qa_prompt.md", transcript_text, click_summary)
+    if custom:
+        return custom
+
+    # Built-in fallback (identical to original)
+    return f"""You are a senior software engineer performing a structured QA/QC review. I recorded a screen review session where I spoke about issues I found while clicking through the application. The red crosshairs in the screenshots mark where I clicked.
+
+Your job: convert my spoken observations and the screenshots into a **structured task list optimised for AI coding agents** (Claude Code, Antigravity, Cursor, Copilot). Each task must be self-contained and detailed enough that an AI agent can create an implementation plan and execute the fix without needing additional context.
+
+## My Spoken Observations (timestamped)
+{transcript_text}
+
+## Click Positions
+{click_summary}
+
+## Output Format
+
+Produce a Markdown document with ### Task N blocks, each containing Priority, Type, Screenshot, What's wrong, Implementation steps, and Acceptance criteria.
+
+Output ONLY the Markdown document.
+"""
 
     return f"""You are a senior software engineer performing a structured QA/QC review. I recorded a screen review session where I spoke about issues I found while clicking through the application. The red crosshairs in the screenshots mark where I clicked.
 
@@ -652,11 +715,12 @@ Produce a Markdown document with this EXACT structure:
 10. Number the tasks sequentially (Task 1, Task 2, etc).
 """
 
+
 def _build_documentation_prompt(
     transcript_text: str,
     clicks: list,
 ) -> str:
-    """Build the Documentation mode system prompt for the vision model.
+    """Return the Documentation mode prompt, preferring the editable file in ``prompts/``.
 
     Purpose:
         Generates an instructional SOP (Standard Operating Procedure) or
@@ -669,12 +733,36 @@ def _build_documentation_prompt(
         clicks: Click records (for step-by-step pairing).
 
     Returns:
-        Prompt string to send as the user message content.
+        Prompt string to send as the user message content.  Sourced from
+        ``prompts/documentation_prompt.md`` if present, otherwise built-in default.
     """
     click_summary = "\n".join(
         f"  - Step screenshot #{c.index}: ({c.x}, {c.y}) at {_epoch_to_time(c.timestamp)}"
         for c in clicks
-    )
+    ) or "  (no screenshots recorded)"
+
+    # Try file-based prompt first
+    custom = _load_prompt("documentation_prompt.md", transcript_text, click_summary)
+    if custom:
+        return custom
+
+    # Built-in fallback
+    return f"""You are a senior technical writer. I recorded a walkthrough of an application while narrating what I was doing. The screenshots show each screen I visited; the red crosshair marks exactly where I clicked.
+
+Your job: transform my narration and screenshots into a **clear, polished tutorial or SOP** that a new user can follow step by step.
+
+## My Narration (timestamped)
+{transcript_text}
+
+## Screenshot Sequence
+{click_summary}
+
+## Output Format
+
+Produce a Markdown how-to guide with Overview, Prerequisites, Step-by-Step Walkthrough (### Step N), Notes & Tips, and Acceptance Checklist.
+
+Write in second person. Output ONLY the Markdown document.
+"""
 
     return f"""You are a senior technical writer. I recorded a walkthrough of an application while narrating what I was doing. The screenshots show each screen I visited; the red crosshair marks exactly where I clicked.
 

@@ -92,12 +92,18 @@ AUDIO_CHANNELS: int = 1  # mono
 # ---------------------------------------------------------------------------
 # Screenshot settings
 # ---------------------------------------------------------------------------
-SCREENSHOT_QUALITY: int = 85  # JPEG quality for annotated screenshots
-CLICK_MARKER_RADIUS: int = 22  # radius of the highlight circle (px)
-CLICK_MARKER_COLOR: str = "#FF2D2D"   # vivid red — primary ring colour
-CLICK_MARKER_HALO: str = "#FFFFFF"    # white halo behind the ring for contrast
-CLICK_MARKER_DOT: str = "#FFFF00"    # bright yellow centre dot, visible on any bg
-CLICK_MARKER_WIDTH: int = 4           # stroke width of the circle
+SCREENSHOT_QUALITY: int = 85   # PNG quality for annotated screenshots
+
+# Click marker — modern ripple style (works on any background colour)
+# Layer 1: white outer ring  → always visible on dark backgrounds
+# Layer 2: indigo filled circle → always visible on light backgrounds
+# Layer 3: white centre dot  → pinpoints the exact pixel on any surface
+CLICK_MARKER_RADIUS: int = 22          # radius of the filled indicator circle (logical px)
+CLICK_MARKER_OUTER: str = "#FFFFFF"    # outer ring colour (white)
+CLICK_MARKER_FILL: str = "#6366F1"     # filled circle colour (indigo)
+CLICK_MARKER_CENTER: str = "#FFFFFF"   # centre dot colour (white)
+CLICK_MARKER_OUTER_GAP: int = 4        # gap (px) between outer ring and filled circle
+CLICK_MARKER_WIDTH: int = 3            # stroke width of the outer ring
 
 # ---------------------------------------------------------------------------
 # Output directory

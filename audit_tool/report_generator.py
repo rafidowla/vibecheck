@@ -624,18 +624,25 @@ def _build_qa_prompt(
         Generates a structured bug/task list optimised for AI coding agents
         (Claude Code, Cursor, Antigravity) and Jira tickets.  Each finding
         becomes an independently actionable task with implementation steps,
-        acceptance criteria, and a screenshot reference.
+        acceptance criteria, and a screenshot reference.  The AI uses
+        screenshots only to select the best-matching one per task by timestamp
+        proximity — it must NOT infer bugs or fixes by reading screen content.
 
     Args:
         transcript_text: Pre-formatted timestamped transcript.
-        clicks: Click records (for position summary).
+        clicks: Click records (for screenshot selection metadata).
 
     Returns:
         Prompt string to send as the user message content.  Sourced from
         ``prompts/qa_prompt.md`` if present, otherwise built-in default.
     """
+    # Include filename + timestamp so the AI can pick the closest screenshot
+    # per task.  Coordinates are included for spatial deduplication of
+    # jittery repeat-clicks.
     click_summary = "\n".join(
-        f"  - Click #{c.index}: ({c.x}, {c.y}) at {_epoch_to_time(c.timestamp)}"
+        f"  - Click #{c.index}: file={c.screenshot_path.name}"
+        f", pos=({c.x}, {c.y})"
+        f", time={_epoch_to_time(c.timestamp)}"
         for c in clicks
     ) or "  (no clicks recorded)"
 
@@ -644,33 +651,29 @@ def _build_qa_prompt(
     if custom:
         return custom
 
-    # Built-in fallback (identical to original)
-    return f"""You are a senior software engineer performing a structured QA/QC review. I recorded a screen review session where I spoke about issues I found while clicking through the application. The red crosshairs in the screenshots mark where I clicked.
+    # Built-in fallback
+    return f"""You are a senior software engineer performing a structured QA/QC review.
 
-Your job: convert my spoken observations and the screenshots into a **structured task list optimised for AI coding agents** (Claude Code, Antigravity, Cursor, Copilot). Each task must be self-contained and detailed enough that an AI agent can create an implementation plan and execute the fix without needing additional context.
+I recorded a screen review session narrating issues while clicking through the application.
+You have my narration, a timestamped click log, and the annotated screenshots.
+
+## Your Role
+
+**All tasks must be based solely on what I SPOKE.** Do not infer new bugs or fixes from the screenshots.
+Use screenshots only to:
+- Select the single best screenshot for each task (closest timestamp to the spoken issue)
+- Deduplicate jittery or repeated clicks on the same area — choose one representative screenshot
 
 ## My Spoken Observations (timestamped)
 {transcript_text}
 
-## Click Positions
+## Click Log (index, file, coordinates, time)
 {click_summary}
 
-## Output Format
-
-Produce a Markdown document with ### Task N blocks, each containing Priority, Type, Screenshot, What's wrong, Implementation steps, and Acceptance criteria.
-
-Output ONLY the Markdown document.
-"""
-
-    return f"""You are a senior software engineer performing a structured QA/QC review. I recorded a screen review session where I spoke about issues I found while clicking through the application. The red crosshairs in the screenshots mark where I clicked.
-
-Your job: convert my spoken observations and the screenshots into a **structured task list optimised for AI coding agents** (Claude Code, Antigravity, Cursor, Copilot). Each task must be self-contained and detailed enough that an AI agent can create an implementation plan and execute the fix without needing additional context.
-
-## My Spoken Observations (timestamped)
-{transcript_text}
-
-## Click Positions
-{click_summary if click_summary else "  (no clicks recorded)"}
+## Screenshot Selection Rules
+1. For each task, pick the screenshot whose timestamp is closest to when I spoke about it.
+2. Treat multiple clicks clustered in the same area within a few seconds as one click — use the clearest screenshot.
+3. If no screenshot is temporally close, write `(no screenshot)` for that task.
 
 ## Output Format
 
@@ -680,40 +683,33 @@ Produce a Markdown document with this EXACT structure:
 # [App/Feature Name] — QA Tasks
 
 ## Summary
-2-3 sentences: what area was reviewed, the biggest issues found.
+2-3 sentences: what area was reviewed, biggest issues found from the narration.
 
 ## Tasks
 
-### Task 1: [Clear, specific title]
+### Task 1: [Clear, specific title from narration]
 - **Priority:** Critical / High / Medium / Low
 - **Type:** Bug | UI | UX | Missing Feature | Performance
 - **Screenshot:** click_NNNN.png
-- **What's wrong:** Describe exactly what is broken or looks wrong. Reference specific UI elements by their visible text, position, or inferred component name.
+- **What's wrong:** [Exactly what I described verbally.]
 - **Implementation steps:**
   1. Open `[likely filename or component]`
-  2. Locate the [element/section] responsible for [behavior]
-  3. Change [specific property] from [current value] to [target value]
-  4. [Any additional steps needed]
+  2. Locate the [element] responsible for [behavior]
+  3. Change [specific property] from [current] to [target]
 - **Acceptance criteria:**
-  - [ ] [Specific, testable condition that confirms the fix]
-  - [ ] [Another condition if needed]
+  - [ ] [Specific, testable condition]
 
-### Task 2: [Title]
-...
+### Task 2: …
 ```
 
 ## Critical Rules
-1. Each task MUST be independently actionable — an AI agent should be able to fix it without reading other tasks.
-2. Reference the specific screenshot filename (click_NNNN.png) that shows the issue.
-3. **Implementation steps** must be CONCRETE code-level instructions — not "improve the button" but "in `ButtonComponent.tsx`, change the `backgroundColor` prop from `#333` to `#4ecca3`, increase `fontSize` from `12px` to `14px`, add `padding: 12px 24px`".
-4. Always specify **likely file or component names** inferred from the UI (e.g. "LoginPage.tsx", "Sidebar.vue", "header.css"). If uncertain, provide your best guess with a note.
-5. **Acceptance criteria** must be specific and testable — an AI agent will use these to verify its fix.
-6. If I mentioned something verbally that isn't visible in screenshots, still create a task for it.
-7. Prioritize: Critical = broken/unusable, High = major visual/UX issue, Medium = polish, Low = nice-to-have.
-8. Group related micro-issues into a single task when they affect the same component.
-9. Output ONLY the Markdown document. No preamble, no explanation, no commentary.
-10. Number the tasks sequentially (Task 1, Task 2, etc).
+1. All tasks must come from the narration — not from reading screenshots.
+2. Each task must be independently actionable by an AI coding agent.
+3. Implementation steps must name specific files, components, props, and values.
+4. Acceptance criteria must be specific and testable.
+5. Number tasks sequentially. Output ONLY the Markdown document.
 """
+
 
 
 def _build_documentation_prompt(
@@ -724,9 +720,10 @@ def _build_documentation_prompt(
 
     Purpose:
         Generates an instructional SOP (Standard Operating Procedure) or
-        tutorial document.  Each screenshot + spoken narration becomes a
-        numbered step in a how-to guide.  Language is instructional
-        ("Click the…", "Enter your…") rather than bug/fix oriented.
+        tutorial document.  Voice narration is the primary content source;
+        screenshot images are used to supplement vague narration with precise
+        UI element names and labels visible on screen.  The AI must not invent
+        steps not spoken about.
 
     Args:
         transcript_text: Pre-formatted timestamped transcript.
@@ -737,7 +734,8 @@ def _build_documentation_prompt(
         ``prompts/documentation_prompt.md`` if present, otherwise built-in default.
     """
     click_summary = "\n".join(
-        f"  - Step screenshot #{c.index}: ({c.x}, {c.y}) at {_epoch_to_time(c.timestamp)}"
+        f"  - Step screenshot #{c.index}: file={c.screenshot_path.name}"
+        f", time={_epoch_to_time(c.timestamp)}"
         for c in clicks
     ) or "  (no screenshots recorded)"
 
@@ -747,11 +745,22 @@ def _build_documentation_prompt(
         return custom
 
     # Built-in fallback
-    return f"""You are a senior technical writer. I recorded a walkthrough of an application while narrating what I was doing. The screenshots show each screen I visited; the red crosshair marks exactly where I clicked.
+    return f"""You are a senior technical writer converting a recorded walkthrough into a how-to guide.
 
-Your job: transform my narration and screenshots into a **clear, polished tutorial or SOP** that a new user can follow step by step.
+You have the speaker's narration and annotated screenshots of each step.
 
-## My Narration (timestamped)
+## Your Role
+
+**Voice narration is your primary source.** Every step in the guide must come from what was spoken.
+Use the screenshots to:
+- Fill in precise UI element names where narration was vague (e.g. "I clicked there" → "Click the **Save as Draft** button")
+- Correct factual slips where what was said clearly differs from what is on screen
+
+Do NOT:
+- Add steps not mentioned in the narration
+- Describe UI elements visible in screenshots that were not spoken about
+
+## Narration (timestamped) — PRIMARY SOURCE
 {transcript_text}
 
 ## Screenshot Sequence
@@ -759,66 +768,14 @@ Your job: transform my narration and screenshots into a **clear, polished tutori
 
 ## Output Format
 
-Produce a Markdown how-to guide with Overview, Prerequisites, Step-by-Step Walkthrough (### Step N), Notes & Tips, and Acceptance Checklist.
+Produce a Markdown how-to guide:
+- Overview (1 sentence)
+- Prerequisites (from narration only, or "None")
+- Steps (### Step N with screenshot reference and 1–3 sentence description in second person)
+- Tips & Gotchas (only if explicitly mentioned)
+- ✅ Done when (single testable condition)
 
 Write in second person. Output ONLY the Markdown document.
-"""
-
-    return f"""You are a senior technical writer. I recorded a walkthrough of an application while narrating what I was doing. The screenshots show each screen I visited; the red crosshair marks exactly where I clicked.
-
-Your job: transform my narration and screenshots into a **clear, polished tutorial or SOP (Standard Operating Procedure)** that a new user can follow step by step. This is NOT a bug report — it is a how-to guide.
-
-## My Narration (timestamped)
-{transcript_text}
-
-## Screenshot Sequence
-{click_summary if click_summary else "  (no screenshots recorded)"}
-
-## Output Format
-
-Produce a Markdown document with this EXACT structure:
-
-```
-# [Application / Feature Name] — How-To Guide
-
-## Overview
-2-3 sentences summarising what this guide covers and who it is for.
-
-## Prerequisites
-- [Any account, permission, or setup requirement — or write "None" if not applicable]
-
-## Step-by-Step Walkthrough
-
-### Step 1: [Action title, e.g. "Log in to the dashboard"]
-**Screenshot:** click_NNNN.png
-
-Describe exactly what the user sees on this screen and what they should do.
-Use instructional language: "Click the **Sign In** button in the top-right corner", "Enter your email address in the **Email** field", etc.
-
-> 💡 **Tip:** [Optional contextual tip, shortcut, or common mistake to avoid]
-
-### Step 2: [Next action]
-...
-
-## Notes & Tips
-- [Any important warnings, edge cases, or best practices for this workflow]
-
-## Acceptance Checklist
-- [ ] [Specific, testable condition confirming the user completed the workflow]
-- [ ] [Another condition if needed]
-```
-
-## Critical Rules
-1. Pair each numbered step with its corresponding screenshot (click_NNNN.png).
-2. Use the RED CROSSHAIR in the screenshot to identify exactly what was clicked — describe that element precisely (button label, field name, menu item).
-3. Write in second person ("you", "your") — never "I" or "the user".
-4. Steps must be short, scannable, and action-oriented. No multi-paragraph essays per step.
-5. Infer the application name and feature context from what is visible on screen.
-6. If a screenshot shows an intermediate loading or confirmation state, still describe it — these are important orientation points for the reader.
-7. The **Acceptance Checklist** at the end should verify that the full workflow was completed successfully, not just individual steps.
-8. Include a **Notes & Tips** section that captures any verbal caveats I mentioned or pitfalls visible in the screenshots.
-9. Output ONLY the Markdown document. No preamble, no explanation, no commentary.
-10. Number steps sequentially.
 """
 
 

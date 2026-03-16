@@ -186,3 +186,12 @@ Record → Stop → [Pick Whisper Model]
 ## 📄 License
 
 [MIT](LICENSE)
+
+---
+
+## 🗺️ Roadmap
+
+- [ ] **Native installers** — `.dmg` (macOS) and `.exe` (Windows) via PyInstaller + NSIS, with whisper-cli bundled. Unsigned for now; notarization pending Apple Developer membership.
+- [ ] **Jira push button** — Re-expose manual Jira push UI once credentials flow is finalized
+- [ ] **Model auto-download UI** — progress bar when whisper model is downloaded on first run
+- [ ] **Session history** — list of past sessions with ability to re-open reports

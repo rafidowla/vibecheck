@@ -104,8 +104,14 @@ class TestClickMarkerScaling(unittest.TestCase):
         if not drawn_coords:
             raise AssertionError("ellipse was never called")
 
-        # ellipse takes [x0, y0, x1, y1]; centre = (x0+r, y0+r)
-        box = drawn_coords[0]
+        # The new ripple marker draws via two ImageDraw instances:
+        #   drawn_coords[0] = semi-transparent indigo fill (on overlay)
+        #   drawn_coords[1] = outer white ring  (on composited image)
+        #   drawn_coords[2] = indigo outline ring (radius = scaled_radius)  ← use this
+        #   drawn_coords[3] = white centre dot
+        # We extract the centre from the indigo outline ring (index 2) because
+        # it uses CLICK_MARKER_RADIUS directly, which is what the tests target.
+        box = drawn_coords[2]
         from audit_tool.config import CLICK_MARKER_RADIUS
         scale_x = physical_w / monitor["width"]
         scaled_radius = int(CLICK_MARKER_RADIUS * scale_x)

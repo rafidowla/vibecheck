@@ -48,9 +48,10 @@ from PIL import Image, ImageDraw
 from pynput import mouse
 
 from audit_tool.config import (
-    CLICK_MARKER_COLOR,
-    CLICK_MARKER_DOT,
-    CLICK_MARKER_HALO,
+    CLICK_MARKER_CENTER,
+    CLICK_MARKER_FILL,
+    CLICK_MARKER_OUTER,
+    CLICK_MARKER_OUTER_GAP,
     CLICK_MARKER_RADIUS,
     CLICK_MARKER_WIDTH,
     SCREENSHOT_QUALITY,
@@ -302,56 +303,67 @@ class MouseTracker:
         # visual size regardless of DPI.
         scaled_radius = int(CLICK_MARKER_RADIUS * scale_x)
         scaled_width = max(1, int(CLICK_MARKER_WIDTH * scale_x))
-        # ── Multi-layer high-contrast marker ──
-        # Layer 1: white halo ring  (always visible against dark backgrounds)
-        # Layer 2: vivid red ring   (primary indicator)
-        # Layer 3: yellow dot       (exact click point, visible on any colour)
-        # Layer 4: crosshairs       (white halo + red line for contrast both ways)
-        draw = ImageDraw.Draw(img)
-        halo_gap = max(2, scaled_width)  # separation between halo and main ring
+        # ── Modern ripple marker — 3 layers, works on any background ──
+        # Layer 1: white outer ring  → visible on dark backgrounds
+        # Layer 2: semi-transparent indigo fill → tints without hiding content
+        # Layer 3: white centre dot  → pinpoints the exact click pixel
+        #
+        # The indigo fill is drawn on a separate RGBA overlay at ~40% opacity
+        # then composited onto the screenshot so the background remains visible.
 
-        # Layer 1 — white halo (slightly larger radius)
-        halo_r = scaled_radius + halo_gap
-        draw.ellipse(
-            [local_x - halo_r, local_y - halo_r,
-             local_x + halo_r, local_y + halo_r],
-            outline=CLICK_MARKER_HALO,
-            width=max(2, scaled_width - 1),
-        )
+        scaled_gap = max(2, int(CLICK_MARKER_OUTER_GAP * scale_x))
+        outer_r = scaled_radius + scaled_gap
 
-        # Layer 2 — vivid red ring
-        draw.ellipse(
+        # Convert to RGBA for alpha compositing, then draw opaque layers last.
+        img = img.convert("RGBA")
+
+        # Layer 2 (drawn first) — semi-transparent indigo fill
+        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        overlay_draw = ImageDraw.Draw(overlay)
+
+        # Parse the hex fill colour and apply 40% alpha (≈ 102 / 255)
+        fill_hex = CLICK_MARKER_FILL.lstrip("#")
+        fill_r = int(fill_hex[0:2], 16)
+        fill_g = int(fill_hex[2:4], 16)
+        fill_b = int(fill_hex[4:6], 16)
+        fill_rgba = (fill_r, fill_g, fill_b, 102)
+
+        overlay_draw.ellipse(
             [local_x - scaled_radius, local_y - scaled_radius,
              local_x + scaled_radius, local_y + scaled_radius],
-            outline=CLICK_MARKER_COLOR,
+            fill=fill_rgba,
+        )
+        img = Image.alpha_composite(img, overlay)
+
+        # Draw opaque layers on top of the composited image.
+        draw = ImageDraw.Draw(img)
+
+        # Layer 1 — white outer ring
+        draw.ellipse(
+            [local_x - outer_r, local_y - outer_r,
+             local_x + outer_r, local_y + outer_r],
+            outline=CLICK_MARKER_OUTER,
             width=scaled_width,
         )
 
-        # Layer 3 — crosshair: white halo pass first, red pass second
-        cross_len = scaled_radius + int(8 * scale_x)
-        halo_w = max(1, scaled_width + 2)
-        for line_color, line_width in [
-            (CLICK_MARKER_HALO, halo_w),
-            (CLICK_MARKER_COLOR, scaled_width),
-        ]:
-            draw.line(
-                [local_x - cross_len, local_y, local_x + cross_len, local_y],
-                fill=line_color, width=line_width,
-            )
-            draw.line(
-                [local_x, local_y - cross_len, local_x, local_y + cross_len],
-                fill=line_color, width=line_width,
-            )
+        # Indigo outline ring on the filled circle for definition
+        draw.ellipse(
+            [local_x - scaled_radius, local_y - scaled_radius,
+             local_x + scaled_radius, local_y + scaled_radius],
+            outline=CLICK_MARKER_FILL,
+            width=max(1, scaled_width - 1),
+        )
 
-        # Layer 4 — bright yellow centre dot (exact click point)
+        # Layer 3 — white centre dot (exact click point)
         dot_r = max(3, int(5 * scale_x))
         draw.ellipse(
             [local_x - dot_r, local_y - dot_r,
              local_x + dot_r, local_y + dot_r],
-            fill=CLICK_MARKER_DOT,
-            outline=CLICK_MARKER_COLOR,
-            width=1,
+            fill=CLICK_MARKER_CENTER,
         )
+
+        # Convert back to RGB for PNG save (no alpha channel in output).
+        img = img.convert("RGB")
 
         logger.debug(
             "Click marker drawn at physical (%d, %d) from logical (%d, %d) "

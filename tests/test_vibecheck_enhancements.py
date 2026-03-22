@@ -160,10 +160,21 @@ class TestPromptBuilders(unittest.TestCase):
 
     These are whitebox tests — they verify the prompt contracts so that
     accidental edits do not silently break the AI output format.
+
+    The prompt builders return ``(system_text, user_text)`` tuples;
+    tests concatenate both to check that the full prompt contains
+    all expected structural markers.
     """
 
     def _sample_transcript(self) -> str:
         return "[00:00 → 00:05] The login button is misaligned on Safari."
+
+    def _sample_raw_transcript(self) -> list:
+        seg = MagicMock()
+        seg.start = 0.0
+        seg.end = 5.0
+        seg.text = "The login button is misaligned on Safari."
+        return [seg]
 
     def _sample_clicks(self) -> list:
         click = MagicMock()
@@ -171,12 +182,23 @@ class TestPromptBuilders(unittest.TestCase):
         click.x = 640
         click.y = 400
         click.timestamp = 1_700_000_000.0
+        path_mock = MagicMock()
+        path_mock.name = "click_0000.png"
+        path_mock.exists.return_value = True
+        click.screenshot_path = path_mock
         return [click]
+
+    def _full_prompt(self, system: str, user: str) -> str:
+        """Concatenate system + user parts for assertion convenience."""
+        return f"{system}\n{user}"
 
     def test_qa_prompt_contains_task_structure(self):
         """QA prompt must instruct the model to produce ### Task N blocks."""
         from audit_tool.report_generator import _build_qa_prompt
-        prompt = _build_qa_prompt(self._sample_transcript(), self._sample_clicks())
+        system, user = _build_qa_prompt(
+            self._sample_transcript(), self._sample_raw_transcript(), self._sample_clicks()
+        )
+        prompt = self._full_prompt(system, user)
 
         self.assertIn("### Task", prompt, "QA prompt must reference ### Task N format")
         self.assertIn("Implementation steps", prompt)
@@ -186,7 +208,10 @@ class TestPromptBuilders(unittest.TestCase):
     def test_qa_prompt_references_ai_agents(self):
         """QA prompt should mention AI coding agents by name."""
         from audit_tool.report_generator import _build_qa_prompt
-        prompt = _build_qa_prompt(self._sample_transcript(), self._sample_clicks())
+        system, user = _build_qa_prompt(
+            self._sample_transcript(), self._sample_raw_transcript(), self._sample_clicks()
+        )
+        prompt = self._full_prompt(system, user)
         self.assertIn("Antigravity", prompt)
         self.assertIn("Claude Code", prompt)
         self.assertIn("Cursor", prompt)
@@ -194,9 +219,10 @@ class TestPromptBuilders(unittest.TestCase):
     def test_documentation_prompt_contains_step_structure(self):
         """Documentation prompt must instruct second-person SOP format."""
         from audit_tool.report_generator import _build_documentation_prompt
-        prompt = _build_documentation_prompt(
-            self._sample_transcript(), self._sample_clicks()
+        system, user = _build_documentation_prompt(
+            self._sample_transcript(), self._sample_raw_transcript(), self._sample_clicks()
         )
+        prompt = self._full_prompt(system, user)
 
         self.assertIn("Step-by-Step Walkthrough", prompt)
         self.assertIn("How-To Guide", prompt)
@@ -206,9 +232,10 @@ class TestPromptBuilders(unittest.TestCase):
     def test_documentation_prompt_is_not_qa(self):
         """Documentation prompt must NOT contain QA-specific bug language."""
         from audit_tool.report_generator import _build_documentation_prompt
-        prompt = _build_documentation_prompt(
-            self._sample_transcript(), self._sample_clicks()
+        system, user = _build_documentation_prompt(
+            self._sample_transcript(), self._sample_raw_transcript(), self._sample_clicks()
         )
+        prompt = self._full_prompt(system, user)
         self.assertNotIn("### Task", prompt)
         self.assertNotIn("Implementation steps", prompt)
 
@@ -216,13 +243,39 @@ class TestPromptBuilders(unittest.TestCase):
         """Both prompts should inject the transcript text."""
         from audit_tool.report_generator import _build_qa_prompt, _build_documentation_prompt
         transcript = self._sample_transcript()
+        raw_segs = self._sample_raw_transcript()
         clicks = self._sample_clicks()
 
-        qa_prompt = _build_qa_prompt(transcript, clicks)
-        doc_prompt = _build_documentation_prompt(transcript, clicks)
+        qa_system, qa_user = _build_qa_prompt(transcript, raw_segs, clicks)
+        doc_system, doc_user = _build_documentation_prompt(transcript, raw_segs, clicks)
+
+        qa_prompt = self._full_prompt(qa_system, qa_user)
+        doc_prompt = self._full_prompt(doc_system, doc_user)
 
         self.assertIn("login button", qa_prompt)
         self.assertIn("login button", doc_prompt)
+
+    def test_qa_prompt_returns_tuple(self):
+        """QA prompt must return a (system, user) tuple."""
+        from audit_tool.report_generator import _build_qa_prompt
+        result = _build_qa_prompt(
+            self._sample_transcript(), self._sample_raw_transcript(), self._sample_clicks()
+        )
+        self.assertIsInstance(result, tuple, "Must return a tuple")
+        self.assertEqual(len(result), 2, "Tuple must have exactly 2 elements")
+        system, user = result
+        self.assertTrue(len(system) > 0, "System prompt must not be empty")
+
+    def test_documentation_prompt_returns_tuple(self):
+        """Documentation prompt must return a (system, user) tuple."""
+        from audit_tool.report_generator import _build_documentation_prompt
+        result = _build_documentation_prompt(
+            self._sample_transcript(), self._sample_raw_transcript(), self._sample_clicks()
+        )
+        self.assertIsInstance(result, tuple, "Must return a tuple")
+        self.assertEqual(len(result), 2, "Tuple must have exactly 2 elements")
+        system, user = result
+        self.assertTrue(len(system) > 0, "System prompt must not be empty")
 
 
 # ===========================================================================

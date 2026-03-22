@@ -53,7 +53,7 @@ import mss
 from PIL import Image, ImageTk
 
 from audit_tool.audio_recorder import AudioRecorder
-from audit_tool.config import create_session_dir, OPENROUTER_API_KEY, ProcessMode, JIRA_CONFIG
+from audit_tool.config import create_session_dir, _get_api_key, ProcessMode, JIRA_CONFIG
 from audit_tool.mouse_tracker import ClickRecord, MouseTracker
 from audit_tool.report_generator import generate_report, cleanup_session, ReportResult, push_to_jira
 from audit_tool.transcriber import transcribe, WHISPER_MODELS, WHISPER_MODEL_SIZE
@@ -248,6 +248,58 @@ def _all_children(widget: tk.Widget) -> list[tk.Widget]:
     return children
 
 
+class _PipelineStatusHandler(logging.Handler):
+    """Logging handler that forwards pipeline INFO messages to the UI status bar.
+
+    Purpose:
+        Bridges `audit_tool.pipeline` log output to the Tkinter status label
+        without coupling pipeline.py to the GUI layer.  Mounted and dismounted
+        on the pipeline logger per-session in `_process_session`.
+
+    Attributes:
+        _callback: Callable that accepts a string and updates the status label.
+
+    Inputs:
+        record (logging.LogRecord): Standard Python log record.
+
+    Side Effects:
+        Calls `_callback` from the background processing thread; callers must
+        ensure the callback is thread-safe (``_set_status_threadsafe`` is).
+
+    Thread Safety: Yes — handler emit() may be called from any thread.
+    """
+
+    # Pipeline stage keywords → friendly UI labels
+    _STAGE_LABELS: dict[str, str] = {
+        "Step 1":  "🔍  Extracting issues from transcript…",
+        "Step 2a": "🕐  Filtering screenshots by timestamp…",
+        "Step 2b": "🖼   Selecting best screenshot…",
+        "Step 3":  "📝  Assembling report…",
+    }
+
+    def __init__(self, callback: "Callable[[str], None]") -> None:
+        super().__init__(level=logging.INFO)
+        self._callback = callback
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Forward recognised pipeline stage messages to the UI status bar.
+
+        Args:
+            record: The log record emitted by the pipeline logger.
+
+        Side Effects:
+            Calls ``self._callback`` if the message matches a known stage.
+        """
+        message = record.getMessage()
+        for keyword, label in self._STAGE_LABELS.items():
+            if keyword in message:
+                try:
+                    self._callback(label)
+                except Exception:
+                    pass
+                return
+
+
 class AuditRecorderApp:
     """Main application class — Tkinter GUI controller.
 
@@ -275,6 +327,7 @@ class AuditRecorderApp:
         self._pause_elapsed: float = 0.0
         self._pause_start: Optional[float] = None
         self._timer_id: Optional[str] = None
+        self._thumb_refresh_id: Optional[str] = None
         self._selected_monitor: int = 1
         self._process_mode: ProcessMode = ProcessMode.QA
 
@@ -288,6 +341,9 @@ class AuditRecorderApp:
 
         self._build_ui()
         self._center_window()
+
+        # Start periodic thumbnail refresh so the preview stays live
+        self._schedule_thumbnail_refresh()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -310,8 +366,8 @@ class AuditRecorderApp:
         ).pack(side="left")
 
         # API status pill
-        api_text = "● AI Ready" if OPENROUTER_API_KEY else "○ Template Mode"
-        api_color = ACCENT if OPENROUTER_API_KEY else FG_DIM
+        api_text = "● AI Ready" if _get_api_key() else "○ Template Mode"
+        api_color = ACCENT if _get_api_key() else FG_DIM
         tk.Label(
             title_frame,
             text=api_text,
@@ -648,6 +704,34 @@ class AuditRecorderApp:
             except Exception:
                 pass
 
+    _THUMB_REFRESH_INTERVAL_MS: int = 3000  # 3 seconds
+
+    def _schedule_thumbnail_refresh(self) -> None:
+        """Periodically refresh monitor thumbnails so the preview stays live.
+
+        Captures a new screenshot of each monitor every 3 seconds and updates
+        the thumbnail widgets.  This keeps the previews current as the user
+        switches windows on the monitored screen.
+
+        Side Effects:
+            Schedules a recurring ``after`` callback on the Tkinter main loop.
+            Captures screenshots via ``mss``.
+
+        Determinism: Deterministic scheduling; screenshot content varies.
+        Idempotency: Safe to call multiple times (cancels previous timer).
+        Thread Safety: Must be called from the main thread.
+        """
+        # Cancel any existing scheduled refresh
+        if self._thumb_refresh_id is not None:
+            self._root.after_cancel(self._thumb_refresh_id)
+            self._thumb_refresh_id = None
+
+        self._refresh_thumbnails()
+        self._thumb_refresh_id = self._root.after(
+            self._THUMB_REFRESH_INTERVAL_MS,
+            self._schedule_thumbnail_refresh,
+        )
+
     # ------------------------------------------------------------------
     # Window geometry
     # ------------------------------------------------------------------
@@ -773,6 +857,12 @@ class AuditRecorderApp:
         self._stop_btn.set_enabled(False)
         self._pause_btn.set_enabled(False)
         self._cancel_btn.set_enabled(False)
+
+        # Pause thumbnail refresh during processing to free CPU
+        if self._thumb_refresh_id is not None:
+            self._root.after_cancel(self._thumb_refresh_id)
+            self._thumb_refresh_id = None
+
         self._set_status(f"⏳  Stopping recorders (model: {selected_model})…")
         self._root.update_idletasks()
 
@@ -800,8 +890,11 @@ class AuditRecorderApp:
         dialog.title("Transcription Settings")
         dialog.configure(bg=BG)
         dialog.resizable(False, False)
+        # NOTE: dialog.transient() intentionally omitted — on macOS, transient
+        # Toplevels vanish when dragged to a different screen because the WM
+        # ties their visibility to the parent's screen. Keeping grab_set()
+        # alone preserves modality without the visibility bug.
         dialog.grab_set()
-        dialog.transient(self._root)
 
         # Center on parent
         dialog.update_idletasks()
@@ -809,6 +902,10 @@ class AuditRecorderApp:
         parent_y = self._root.winfo_rooty()
         parent_w = self._root.winfo_width()
         dialog.geometry(f"+{parent_x + parent_w // 2 - 180}+{parent_y + 60}")
+
+        # Ensure dialog is visible and focused on any screen
+        dialog.lift()
+        dialog.focus_force()
 
         # Title
         tk.Label(
@@ -870,6 +967,8 @@ class AuditRecorderApp:
 
         def on_cancel():
             dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", on_cancel)
 
         process_btn = StyledButton(
             btn_frame, "▶  Process", "#22906a", "#ffffff", on_process
@@ -941,10 +1040,25 @@ class AuditRecorderApp:
                 f"{len(clicks)} clicks, mode: {self._process_mode.value})…"
             )
 
-            assert self._session_dir is not None
-            result = generate_report(
-                self._session_dir, segments, clicks, mode=self._process_mode
-            )
+            # Wire per-step progress updates into the UI status bar.
+            # The callback is called by the pipeline at each stage transition.
+            def pipeline_status_callback(message: str) -> None:
+                self._set_status_threadsafe(message)
+
+            # Patch the pipeline logger to forward INFO-level step messages
+            # to the UI status bar without requiring a pipeline API change.
+            import logging as _logging
+            _pipeline_handler = _PipelineStatusHandler(pipeline_status_callback)
+            _pipeline_logger = _logging.getLogger("audit_tool.pipeline")
+            _pipeline_logger.addHandler(_pipeline_handler)
+
+            try:
+                assert self._session_dir is not None
+                result = generate_report(
+                    self._session_dir, segments, clicks, mode=self._process_mode
+                )
+            finally:
+                _pipeline_logger.removeHandler(_pipeline_handler)
 
             # Take a snapshot of clicks before we delete them — needed for
             # the on-demand Jira push button in _show_completion_dialog.
@@ -1022,7 +1136,9 @@ class AuditRecorderApp:
         self._cancel_btn.set_enabled(False)
         self._timer_label.configure(text="")
         self._click_count_label.configure(text="")
-        self._refresh_thumbnails()
+
+        # Restart periodic thumbnail refresh (paused during processing)
+        self._schedule_thumbnail_refresh()
 
     def _show_completion_dialog(
         self,

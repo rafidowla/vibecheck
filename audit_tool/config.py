@@ -30,6 +30,7 @@ Thread Safety: Yes — all values are read-only after module load.
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -39,10 +40,146 @@ from typing import Optional
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
-# Bootstrap: load .env from the project root (two levels up from this file)
+# Bootstrap: resolve base path for bundled resources
 # ---------------------------------------------------------------------------
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(_PROJECT_ROOT / ".env")
+
+
+def resource_path(relative: str) -> Path:
+    """Resolve a project-relative path for both development and PyInstaller.
+
+    Purpose:
+        When running inside a PyInstaller bundle, data files are extracted
+        to a temporary ``sys._MEIPASS`` directory.  In normal development,
+        paths are relative to the project root.  This function abstracts
+        the difference so every module can use ``resource_path('prompts')``
+        regardless of execution context.
+
+    Args:
+        relative: A path string relative to the project root, e.g.
+            ``"prompts"`` or ``".env"`` or ``"bin/whisper-cli"``.
+
+    Returns:
+        Absolute ``Path`` to the resource.
+
+    Side Effects: None.
+    Determinism: Deterministic.
+    Idempotency: Yes.
+    Thread Safety: Yes — read-only.
+    """
+    # PyInstaller sets sys._MEIPASS to the temp extraction directory
+    base = getattr(sys, "_MEIPASS", None)
+    if base is not None:
+        return Path(base) / relative
+    return _PROJECT_ROOT / relative
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap: load .env from the best available location
+# ---------------------------------------------------------------------------
+# Uses a manual parser to directly set os.environ — more reliable than
+# python-dotenv in PyInstaller .app bundles on macOS where load_dotenv()
+# can silently fail due to import ordering or sandboxing.
+#
+# Search order (first found wins):
+#   1. ~/.vibecheck/.env       — user config, always writable
+#   2. Next to the executable  — for portable installs
+#   3. Project root            — development mode
+#   4. PyInstaller bundle      — bundled .env.example fallback
+
+_USER_CONFIG_DIR = Path.home() / ".vibecheck"
+_ENV_SEARCH_PATHS = [
+    _USER_CONFIG_DIR / ".env",
+    Path(sys.executable).parent / ".env",
+    _PROJECT_ROOT / ".env",
+    resource_path(".env"),
+]
+
+_startup_log_lines: list[str] = []
+_startup_log_lines.append(f"VibeCheck startup | sys.executable={sys.executable}")
+_startup_log_lines.append(f"HOME={Path.home()}")
+_startup_log_lines.append(f"_MEIPASS={getattr(sys, '_MEIPASS', 'N/A')}")
+
+
+def _load_env_file(env_path: Path) -> int:
+    """Parse a .env file and write variables directly into os.environ.
+
+    Purpose:
+        Bypasses python-dotenv to avoid PyInstaller .app bundle issues where
+        load_dotenv() silently fails on macOS.
+
+    Args:
+        env_path: Absolute path to the .env file to parse.
+
+    Returns:
+        The number of environment variables successfully set.
+
+    Side Effects:
+        Writes values directly to os.environ.
+
+    Determinism: Deterministic.
+    Idempotency: Yes.
+    Thread Safety: Yes (os.environ writes are atomic on CPython).
+    """
+    count = 0
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" not in stripped:
+            continue
+        key, _, raw_value = stripped.partition("=")
+        key = key.strip()
+        value = raw_value.strip().strip('"').strip("'")
+        if key and value:
+            os.environ[key] = value
+            count += 1
+    return count
+
+
+_env_loaded = False
+for _env_path in _ENV_SEARCH_PATHS:
+    _exists = _env_path.exists()
+    _startup_log_lines.append(f"  checking: {_env_path} -> {'EXISTS' if _exists else 'missing'}")
+    if _exists:
+        try:
+            _n = _load_env_file(_env_path)
+            _startup_log_lines.append(f"  loaded {_n} vars from {_env_path}")
+            _env_loaded = True
+        except Exception as _exc:
+            _startup_log_lines.append(f"  ERROR loading {_env_path}: {_exc}")
+        break
+
+if not _env_loaded:
+    _example = resource_path(".env.example")
+    _startup_log_lines.append(f"  no .env found, checking example: {_example}")
+    if _example.exists():
+        _USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        _dest = _USER_CONFIG_DIR / ".env"
+        import shutil
+        shutil.copy2(str(_example), str(_dest))
+        try:
+            _n = _load_env_file(_dest)
+            _startup_log_lines.append(f"  created ~/.vibecheck/.env from example, loaded {_n} vars")
+        except Exception as _exc:
+            _startup_log_lines.append(f"  ERROR loading created .env: {_exc}")
+
+_startup_log_lines.append(
+    "  OPENROUTER_API_KEY after load: "
+    + ("SET (len=" + str(len(os.environ.get("OPENROUTER_API_KEY", ""))) + ")"
+       if os.environ.get("OPENROUTER_API_KEY") else "EMPTY")
+)
+
+# Write startup log for diagnostics
+try:
+    _USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    (_USER_CONFIG_DIR / "startup.log").write_text(
+        "\n".join(_startup_log_lines) + "\n", encoding="utf-8"
+    )
+except Exception:
+    pass  # Non-fatal — diagnostics only
+
+
 
 # ---------------------------------------------------------------------------
 # OpenRouter settings
@@ -71,6 +208,20 @@ class ProcessMode(str, Enum):
 # ---------------------------------------------------------------------------
 # OpenRouter settings
 # ---------------------------------------------------------------------------
+# NOTE: Read at call-time (not module-import time) to handle PyInstaller bundles
+# where the .env may be loaded after some imports resolve.
+
+def _get_api_key() -> str:
+    """Return the OpenRouter API key from the environment.
+
+    Returns:
+        The API key string, or an empty string if not configured.
+
+    Side Effects: None.
+    Thread Safety: Yes — read-only os.environ access.
+    """
+    return os.getenv("OPENROUTER_API_KEY", "")
+
 
 OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL: str = os.getenv(

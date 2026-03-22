@@ -48,7 +48,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 from audit_tool.config import (
     JIRA_CONFIG,
-    OPENROUTER_API_KEY,
+    _get_api_key,
     OPENROUTER_BASE_URL,
     OPENROUTER_MODEL,
     ProcessMode,
@@ -146,17 +146,39 @@ def generate_report(
     md_path = session_dir / "feedback.md"
     slug = ""
 
-    # ── Step 4: Generate content ──
-    if OPENROUTER_API_KEY:
+    # ── Step 4: Generate content via 3-step multi-agent pipeline ──
+    if _get_api_key():
         try:
-            markdown_content, usage = _generate_via_api(transcript, clicks, mode)
-
-            input_tokens = usage.get("prompt_tokens", 0)
-            output_tokens = usage.get("completion_tokens", 0)
-            cost_usd = (
-                input_tokens * _COST_PER_1M_INPUT_TOKENS / 1_000_000
-                + output_tokens * _COST_PER_1M_OUTPUT_TOKENS / 1_000_000
+            from audit_tool.pipeline import (
+                PipelineError,
+                run_documentation_pipeline,
+                run_qa_pipeline,
             )
+
+            logger.info("Starting multi-agent pipeline (mode=%s).", mode.value)
+
+            if mode == ProcessMode.DOCUMENTATION:
+                markdown_content = run_documentation_pipeline(
+                    transcript=transcript,
+                    clicks=clicks,
+                    session_dir=session_dir,
+                    api_key=_get_api_key(),
+                    model=OPENROUTER_MODEL,
+                )
+            else:
+                markdown_content = run_qa_pipeline(
+                    transcript=transcript,
+                    clicks=clicks,
+                    session_dir=session_dir,
+                    api_key=_get_api_key(),
+                    model=OPENROUTER_MODEL,
+                )
+
+            # Usage tracking: pipeline makes multiple calls so we report 0
+            # for individual token counts (exact tracking is in pipeline logs).
+            input_tokens = 0
+            output_tokens = 0
+            cost_usd = 0.0
 
             slug = _extract_slug(markdown_content)
             if slug:
@@ -169,7 +191,7 @@ def generate_report(
             html_path.write_text(html_content, encoding="utf-8")
             _build_docx_report(docx_path, markdown_content, transcript, clicks)
 
-            # ── Step 5: Optional Jira push ──
+            # ── Optional Jira push ──
             jira_keys: list[str] = []
             if JIRA_CONFIG is not None:
                 try:
@@ -179,7 +201,7 @@ def generate_report(
                 except Exception as jira_error:
                     logger.error("Jira push failed: %s", jira_error)
 
-            logger.info("AI report saved → %s (cost: $%.4f)", html_path, cost_usd)
+            logger.info("Pipeline report saved → %s", html_path)
             return ReportResult(
                 report_path=html_path,
                 slug=slug,
@@ -190,8 +212,64 @@ def generate_report(
                 jira_keys=jira_keys,
                 markdown_content=markdown_content,
             )
-        except Exception:
-            logger.exception("OpenRouter API failed — falling back to template.")
+
+        except Exception as _pipeline_error:
+            import traceback as _tb
+            _err_text = _tb.format_exc()
+            logger.exception(
+                "Pipeline failed (%s) — falling back to legacy single-call path.",
+                type(_pipeline_error).__name__,
+            )
+            # Write error log readable outside the .app bundle
+            try:
+                _err_log = Path.home() / ".vibecheck" / "error.log"
+                _err_log.parent.mkdir(parents=True, exist_ok=True)
+                _err_log.write_text(
+                    f"Pipeline failed at {__import__('datetime').datetime.now()}:\n{_err_text}\n",
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+
+            # ── Legacy fallback: original single-call path ──
+            try:
+                markdown_content, usage = _generate_via_api(
+                    transcript, clicks, mode, session_dir
+                )
+                input_tokens = usage.get("prompt_tokens", 0)
+                output_tokens = usage.get("completion_tokens", 0)
+                cost_usd = (
+                    input_tokens * _COST_PER_1M_INPUT_TOKENS / 1_000_000
+                    + output_tokens * _COST_PER_1M_OUTPUT_TOKENS / 1_000_000
+                )
+                slug = _extract_slug(markdown_content)
+                if slug:
+                    md_path = session_dir / f"{slug}.md"
+                    html_path = session_dir / f"{slug}.html"
+                    docx_path = session_dir / f"{slug}.docx"
+                md_path.write_text(markdown_content, encoding="utf-8")
+                html_content = _wrap_markdown_in_html(markdown_content, img_lookup)
+                html_path.write_text(html_content, encoding="utf-8")
+                _build_docx_report(docx_path, markdown_content, transcript, clicks)
+                jira_keys = []
+                if JIRA_CONFIG is not None:
+                    try:
+                        jira_keys = push_to_jira(JIRA_CONFIG, markdown_content, clicks, mode)
+                    except Exception as jira_error:
+                        logger.error("Jira push failed: %s", jira_error)
+                logger.info("Legacy AI report saved → %s (cost: $%.4f)", html_path, cost_usd)
+                return ReportResult(
+                    report_path=html_path,
+                    slug=slug,
+                    model=OPENROUTER_MODEL,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cost_usd=cost_usd,
+                    jira_keys=jira_keys,
+                    markdown_content=markdown_content,
+                )
+            except Exception:
+                logger.exception("Legacy single-call path also failed — falling back to template.")
 
     # ── Fallback: template-based report ──
     markdown_content = _generate_template_report(transcript, clicks, mode)
@@ -251,10 +329,18 @@ def cleanup_session(session_dir: Path, result: ReportResult) -> Path:
     cost_path.write_text("\n".join(cost_lines) + "\n", encoding="utf-8")
     logger.info("Cost summary → %s", cost_path)
 
-    # ── Rename directory to slug ──
+    # ── Rename directory to descriptive slug with date suffix ──
     final_dir = session_dir
+    # Append YYYYMMDD as suffix for human readability (name visible first when truncated):
+    #   e.g. "login-page-20260319" instead of "20260319-login-page"
+    date_suffix = datetime.now().strftime("%Y%m%d")
     if result.slug:
-        final_dir = _rename_session_dir(session_dir, result.slug)
+        dated_slug = f"{result.slug}-{date_suffix}"
+        final_dir = _rename_session_dir(session_dir, dated_slug)
+    else:
+        # Fallback: clean up the temp name to a readable HHMMSS-YYYYMMDD format
+        fallback_slug = datetime.now().strftime("%H%M%S-%Y%m%d")
+        final_dir = _rename_session_dir(session_dir, fallback_slug)
 
     return final_dir
 
@@ -494,8 +580,14 @@ def _generate_via_api(
     transcript: list[TranscriptSegment],
     clicks: list,
     mode: ProcessMode = ProcessMode.QA,
+    session_dir: Optional[Path] = None,
 ) -> Tuple[str, dict]:
     """Call the OpenRouter chat completions endpoint with vision.
+
+    Sends the prompt instructions as a ``system`` message and the session
+    data (transcript, click log, screenshots) as the ``user`` message.
+    This separation prevents models from treating the instructions as
+    content to echo back.
 
     Args:
         transcript: Timestamped speech segments.
@@ -508,18 +600,24 @@ def _generate_via_api(
     Raises:
         httpx.HTTPStatusError: On non-2xx responses.
         httpx.TimeoutException: On network timeout.
+        RuntimeError: If the AI response fails validation.
     """
     transcript_text = _format_transcript(transcript)
 
     if mode == ProcessMode.DOCUMENTATION:
-        prompt_text = _build_documentation_prompt(transcript_text, clicks)
+        system_text, user_text = _build_documentation_prompt(
+            transcript_text, transcript, clicks, session_dir
+        )
     else:
-        prompt_text = _build_qa_prompt(transcript_text, clicks)
+        system_text, user_text = _build_qa_prompt(
+            transcript_text, transcript, clicks, session_dir
+        )
 
-    content: list[dict[str, Any]] = [
+    # Build the user content array: text + screenshot images
+    user_content: list[dict[str, Any]] = [
         {
             "type": "text",
-            "text": prompt_text,
+            "text": user_text,
         }
     ]
 
@@ -532,7 +630,15 @@ def _generate_via_api(
             logger.warning("Screenshot missing, skipping: %s", img_path)
             continue
         b64 = base64.b64encode(img_path.read_bytes()).decode("ascii")
-        content.append(
+        # Label the image so the model can correctly reference the filename.
+        # Without this, the model guesses which click_XXXX.png maps to which image.
+        user_content.append(
+            {
+                "type": "text",
+                "text": f"[Image: {img_path.name} — Click #{click.index}]",
+            }
+        )
+        user_content.append(
             {
                 "type": "image_url",
                 "image_url": {
@@ -544,13 +650,16 @@ def _generate_via_api(
 
     payload = {
         "model": OPENROUTER_MODEL,
-        "messages": [{"role": "user", "content": content}],
+        "messages": [
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": user_content},
+        ],
         "max_tokens": 8192,
         "temperature": 0.3,
     }
 
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": f"Bearer {_get_api_key()}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://github.com/vibecheck",
         "X-Title": "VibeCheck",
@@ -572,20 +681,48 @@ def _generate_via_api(
         usage.get("prompt_tokens", 0),
         usage.get("completion_tokens", 0),
     )
+
+    # ── Validate AI response ──
+    # If the response doesn't contain any heading or structural markers,
+    # the model likely ignored the prompt and dumped raw content.
+    if mode == ProcessMode.QA:
+        expected_markers = ["Task", "#"]
+    else:
+        expected_markers = ["Step", "#"]
+
+    has_structure = any(marker in markdown_text for marker in expected_markers)
+    if not has_structure:
+        logger.warning(
+            "AI response lacks expected structure markers %s — "
+            "response may not follow the prompt. Falling back to template.",
+            expected_markers,
+        )
+        raise RuntimeError("AI response did not follow prompt structure.")
+
     return markdown_text, usage
 
 
-_PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
+from audit_tool.config import resource_path as _resource_path
+
+_PROMPTS_DIR = _resource_path("prompts")
 
 
-def _load_prompt(filename: str, transcript_text: str, click_summary: str) -> str:
+def _load_prompt(
+    filename: str,
+    transcript_text: str,
+    click_summary: str,
+) -> Tuple[str, str]:
     """Load a prompt template from the ``prompts/`` directory and substitute values.
 
     Purpose:
         Allows users to customise the AI prompt without editing Python source.
         Reads ``prompts/<filename>`` and substitutes ``{{TRANSCRIPT}}`` and
-        ``{{CLICKS}}`` placeholders.  Falls back silently to the built-in default
-        string returned by the caller if the file is missing or unreadable.
+        ``{{CLICKS}}`` placeholders.
+
+        If the file contains a ``---`` separator line, everything above it is
+        treated as the **system prompt** (instructions) and everything below
+        as the **user data**.  If no separator exists, the entire content is
+        used as the system prompt and the user data is left empty.
 
     Args:
         filename: Prompt file name, e.g. ``"qa_prompt.md"``.
@@ -593,8 +730,8 @@ def _load_prompt(filename: str, transcript_text: str, click_summary: str) -> str
         click_summary: Formatted click position summary to inject.
 
     Returns:
-        The rendered prompt string with placeholders substituted.
-        Returns an empty string if the file cannot be read (caller uses default).
+        A ``(system_text, user_text)`` tuple with placeholders substituted.
+        Returns ``("", "")`` if the file cannot be read (caller uses default).
 
     Side Effects:
         Reads one file from disk.
@@ -608,72 +745,151 @@ def _load_prompt(filename: str, transcript_text: str, click_summary: str) -> str
             .replace("{{CLICKS}}", click_summary)
         )
         logger.info("Loaded custom prompt from %s", prompt_path)
-        return rendered
+        return rendered, ""
     except OSError:
         logger.debug("Prompt file not found: %s — using built-in default.", prompt_path)
-        return ""
+        return "", ""
+
+
+def _build_correlated_click_log(
+    transcript: list,
+    clicks: list,
+    session_dir: Optional[Path] = None,
+) -> str:
+    """Build a click log where each click is annotated with concurrent speech.
+
+    Purpose:
+        Closes the time-axis gap between TranscriptSegment.start (seconds from
+        recording start) and ClickRecord.timestamp (Unix epoch).  The result
+        is an annotated click log the model can use to pick the most
+        contextually relevant screenshot for each issue described in the narration.
+
+    Algorithm:
+        1. Read recording_start.txt (written by AudioRecorder.start()) for the
+           true recording start epoch.  This correctly handles sessions where
+           the user narrated for several seconds before clicking.
+           Falls back to min(click_epoch) - earliest_transcript_start if the
+           file is absent (backwards compatibility with old sessions).
+        2. For each click, convert its epoch to session-relative seconds.
+        3. Find all transcript segments whose window overlaps ±5 s around the
+           click.  A wider window handles speech that started before/after a click.
+        4. Format: "Click #N @ T+X.Xs → \"spoken text\" — file=click_NNNN.png"
+
+    Args:
+        transcript: Ordered list of TranscriptSegment with .start and .end.
+        clicks: Click records with .timestamp (Unix epoch) and .screenshot_path.
+        session_dir: Session directory containing recording_start.txt.
+
+    Returns:
+        A multi-line string describing each click with its concurrent speech context.
+
+    Side Effects: None.
+    Determinism: Deterministic.
+    Thread Safety: Yes (read-only).
+    """
+    if not clicks:
+        return "  (no clicks recorded)"
+
+    # ── Derive session_start_epoch ──────────────────────────────────────
+    # Primary: read the exact epoch that AudioRecorder.start() stamped.
+    # Fallback: estimate from min(click epoch) - earliest transcript start
+    # (this under-anchors if the user narrated before clicking, but beats nothing).
+    session_start_epoch: float = 0.0
+    anchor_source = "fallback"
+
+    if session_dir is not None:
+        start_file = session_dir / "recording_start.txt"
+        if start_file.exists():
+            try:
+                session_start_epoch = float(start_file.read_text(encoding="utf-8").strip())
+                anchor_source = "recording_start.txt"
+            except Exception:
+                pass
+
+    if anchor_source == "fallback":
+        earliest_click: float = min(c.timestamp for c in clicks)
+        earliest_transcript: float = min((seg.start for seg in transcript), default=0.0)
+        session_start_epoch = earliest_click - earliest_transcript
+
+    lines: list[str] = [
+        f"  [anchor={anchor_source}, session_start_epoch={session_start_epoch:.3f}]"
+    ]
+    for click in clicks:
+        click_session_t = click.timestamp - session_start_epoch
+
+        # Find transcript segments concurrent with (or within 5 s of) this click.
+        # A wider window handles the natural delay between speaking and clicking.
+        window = 5.0
+        concurrent: list[str] = [
+            seg.text.strip()
+            for seg in transcript
+            if seg.start - window <= click_session_t <= seg.end + window
+        ]
+        speech = (
+            '"' + " ".join(concurrent) + '"'
+            if concurrent
+            else "(between speech segments)"
+        )
+
+        lines.append(
+            f"  - Click #{click.index} @ T+{click_session_t:.1f}s"
+            f" → {speech}"
+            f" — file={click.screenshot_path.name}"
+            f", pos=({click.x:.0f}, {click.y:.0f})"
+        )
+
+
+
+    return "\n".join(lines)
 
 
 def _build_qa_prompt(
     transcript_text: str,
+    transcript: list,
     clicks: list,
-) -> str:
-    """Return the QA mode prompt, preferring the editable file in ``prompts/``.
+    session_dir: Optional[Path] = None,
+) -> tuple:
+    """Return the QA mode prompt as a (system, user) pair.
 
     Purpose:
-        Generates a structured bug/task list optimised for AI coding agents
-        (Claude Code, Cursor, Antigravity) and Jira tickets.  Each finding
-        becomes an independently actionable task with implementation steps,
-        acceptance criteria, and a screenshot reference.  The AI uses
-        screenshots only to select the best-matching one per task by timestamp
-        proximity — it must NOT infer bugs or fixes by reading screen content.
+        Generates a structured bug/task list for AI coding agents.  The
+        temporally-correlated click log lets the model pick the screenshot
+        closest to when each issue was spoken — not just the nearest by index.
 
     Args:
-        transcript_text: Pre-formatted timestamped transcript.
-        clicks: Click records (for screenshot selection metadata).
+        transcript_text: Pre-formatted timestamped transcript string.
+        transcript: Raw TranscriptSegment list for temporal correlation.
+        clicks: Click records with screenshot paths.
+        session_dir: Session directory containing recording_start.txt.
 
     Returns:
-        Prompt string to send as the user message content.  Sourced from
-        ``prompts/qa_prompt.md`` if present, otherwise built-in default.
+        A (system_text, user_text) tuple.
     """
-    # Include filename + timestamp so the AI can pick the closest screenshot
-    # per task.  Coordinates are included for spatial deduplication of
-    # jittery repeat-clicks.
-    click_summary = "\n".join(
-        f"  - Click #{c.index}: file={c.screenshot_path.name}"
-        f", pos=({c.x}, {c.y})"
-        f", time={_epoch_to_time(c.timestamp)}"
-        for c in clicks
-    ) or "  (no clicks recorded)"
+    click_summary = _build_correlated_click_log(transcript, clicks, session_dir)
 
     # Try file-based prompt first
-    custom = _load_prompt("qa_prompt.md", transcript_text, click_summary)
-    if custom:
-        return custom
+    custom_system, custom_user = _load_prompt("qa_prompt.md", transcript_text, click_summary)
+    if custom_system:
+        return custom_system, custom_user
 
-    # Built-in fallback
-    return f"""You are a senior software engineer performing a structured QA/QC review.
+    # Built-in fallback — system prompt (instructions)
+    system_text = """You are a senior software engineer performing a structured QA/QC review.
 
 I recorded a screen review session narrating issues while clicking through the application.
-You have my narration, a timestamped click log, and the annotated screenshots.
+You have my narration, a temporally-correlated click log, and the annotated screenshots.
 
 ## Your Role
 
 **All tasks must be based solely on what I SPOKE.** Do not infer new bugs or fixes from the screenshots.
 Use screenshots only to:
-- Select the single best screenshot for each task (closest timestamp to the spoken issue)
+- Select the single best screenshot for each task using the concurrent speech context
 - Deduplicate jittery or repeated clicks on the same area — choose one representative screenshot
 
-## My Spoken Observations (timestamped)
-{transcript_text}
-
-## Click Log (index, file, coordinates, time)
-{click_summary}
-
 ## Screenshot Selection Rules
-1. For each task, pick the screenshot whose timestamp is closest to when I spoke about it.
-2. Treat multiple clicks clustered in the same area within a few seconds as one click — use the clearest screenshot.
-3. If no screenshot is temporally close, write `(no screenshot)` for that task.
+1. Each click in the log is annotated with what was being spoken at that moment.
+2. For each task, pick the screenshot whose spoken-text annotation best matches the issue described.
+3. If multiple clicks share similar speech context, pick the one closest in time to the issue.
+4. If no click is contextually close to a spoken issue, write `(no screenshot)` for that task.
 
 ## Output Format
 
@@ -691,6 +907,7 @@ Produce a Markdown document with this EXACT structure:
 - **Priority:** Critical / High / Medium / Low
 - **Type:** Bug | UI | UX | Missing Feature | Performance
 - **Screenshot:** click_NNNN.png
+- **Target Component:** `[Best guess at file/component, e.g., Sidebar.tsx or header.css]`
 - **What's wrong:** [Exactly what I described verbally.]
 - **Implementation steps:**
   1. Open `[likely filename or component]`
@@ -706,65 +923,74 @@ Produce a Markdown document with this EXACT structure:
 1. All tasks must come from the narration — not from reading screenshots.
 2. Each task must be independently actionable by an AI coding agent.
 3. Implementation steps must name specific files, components, props, and values.
-4. Acceptance criteria must be specific and testable.
-5. Number tasks sequentially. Output ONLY the Markdown document.
-"""
+4. Do not guess exact hex codes, pixel values, or font sizes unless I stated them.
+5. Consolidate related micro-issues affecting the same component into a single task.
+6. Acceptance criteria must be specific and testable.
+7. Number tasks sequentially. Output ONLY the Markdown document."""
+
+    # User message — session data
+    user_text = f"""## My Spoken Observations (timestamped)
+{transcript_text}
+
+## Click Log — each click annotated with concurrent speech
+(Use the spoken text next to each click to pick the best screenshot for each task.
+ The click whose speech annotation matches the issue is the right screenshot to use.)
+{click_summary}"""
+
+    return system_text, user_text
+
 
 
 
 def _build_documentation_prompt(
     transcript_text: str,
+    transcript: list,
     clicks: list,
-) -> str:
-    """Return the Documentation mode prompt, preferring the editable file in ``prompts/``.
+    session_dir: Optional[Path] = None,
+) -> tuple:
+    """Return the Documentation mode prompt as a (system, user) pair.
 
     Purpose:
-        Generates an instructional SOP (Standard Operating Procedure) or
-        tutorial document.  Voice narration is the primary content source;
-        screenshot images are used to supplement vague narration with precise
-        UI element names and labels visible on screen.  The AI must not invent
-        steps not spoken about.
+        Generates an instructional SOP / tutorial document.  Voice narration is
+        the primary content source.  The correlated click log maps each screenshot
+        to the speech spoken at that moment so the model pairs steps with the
+        most contextually relevant screenshot.
 
     Args:
         transcript_text: Pre-formatted timestamped transcript.
+        transcript: Raw TranscriptSegment list for temporal correlation.
         clicks: Click records (for step-by-step pairing).
+        session_dir: Session directory containing recording_start.txt.
 
     Returns:
-        Prompt string to send as the user message content.  Sourced from
-        ``prompts/documentation_prompt.md`` if present, otherwise built-in default.
+        A (system_text, user_text) tuple.
     """
-    click_summary = "\n".join(
-        f"  - Step screenshot #{c.index}: file={c.screenshot_path.name}"
-        f", time={_epoch_to_time(c.timestamp)}"
-        for c in clicks
-    ) or "  (no screenshots recorded)"
+    click_summary = _build_correlated_click_log(transcript, clicks, session_dir)
 
     # Try file-based prompt first
-    custom = _load_prompt("documentation_prompt.md", transcript_text, click_summary)
-    if custom:
-        return custom
+    custom_system, custom_user = _load_prompt("documentation_prompt.md", transcript_text, click_summary)
+    if custom_system:
+        return custom_system, custom_user
 
-    # Built-in fallback
-    return f"""You are a senior technical writer converting a recorded walkthrough into a how-to guide.
+    # Built-in fallback — system prompt (instructions)
+    system_text = """You are a senior technical writer converting a recorded walkthrough into a how-to guide.
 
 You have the speaker's narration and annotated screenshots of each step.
+Each screenshot in the click log is annotated with what was being spoken at the moment of the click.
 
 ## Your Role
 
-**Voice narration is your primary source.** Every step in the guide must come from what was spoken.
+**Voice narration dictates the core steps.** Every step in the guide must correlate to an action that was spoken.
+However, you MUST use the visual evidence in the screenshots to drastically enrich the descriptions of the steps. Make your documentation far more descriptive, accurate, and professional than my rough verbal narration by observing the exact UI state shown in the screenshots.
+
 Use the screenshots to:
-- Fill in precise UI element names where narration was vague (e.g. "I clicked there" → "Click the **Save as Draft** button")
-- Correct factual slips where what was said clearly differs from what is on screen
+- Drastically improve the descriptiveness of the UI elements, using exact labels, exact icon shapes, button colors, and visual layout details visible in the image.
+- Fill in precise UI element names where narration was vague (e.g. "I clicked there" → "Click the blue **Save as Draft** button next to the title").
+- Match each step to the screenshot whose speech annotation best matches the narrated action.
 
 Do NOT:
-- Add steps not mentioned in the narration
-- Describe UI elements visible in screenshots that were not spoken about
-
-## Narration (timestamped) — PRIMARY SOURCE
-{transcript_text}
-
-## Screenshot Sequence
-{click_summary}
+- Add extra functional steps or entirely new concepts not mentioned or implied by the narration.
+- Hallucinate UI elements or features that are not clearly visible in the screenshots.
 
 ## Output Format
 
@@ -775,8 +1001,17 @@ Produce a Markdown how-to guide:
 - Tips & Gotchas (only if explicitly mentioned)
 - ✅ Done when (single testable condition)
 
-Write in second person. Output ONLY the Markdown document.
-"""
+Write in second person. Output ONLY the Markdown document."""
+
+    # User message — session data
+    user_text = f"""## Narration (timestamped) — PRIMARY SOURCE
+{transcript_text}
+
+## Screenshot Sequence — each annotated with concurrent speech
+(Use the spoken text next to each screenshot to pair steps with the correct image.)
+{click_summary}"""
+
+    return system_text, user_text
 
 
 

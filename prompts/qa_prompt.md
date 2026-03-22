@@ -44,6 +44,7 @@ This output must be **optimised for AI coding agents** (Claude Code, Antigravity
 - **Priority:** Critical / High / Medium / Low
 - **Type:** Bug | UI | UX | Missing Feature | Performance
 - **Screenshot:** click_NNNN.png
+- **Target Component:** `[Best guess at file/component, e.g., Sidebar.tsx or header.css]`
 - **What's wrong:** [Exactly what I described verbally. Reference UI elements I named.]
 - **Implementation steps:**
   1. [Concrete code-level step]
@@ -59,5 +60,7 @@ This output must be **optimised for AI coding agents** (Claude Code, Antigravity
 1. All tasks must be grounded in the narration — not in what you see in screenshots.
 2. Each task must be independently actionable by an AI coding agent (Claude Code, Antigravity, Cursor, Copilot).
 3. Implementation steps must be concrete (file names, prop names, values) — not vague.
-4. Acceptance criteria must be specific and testable.
-5. Number tasks sequentially. Output ONLY the Markdown document.
+4. Do not guess exact hex codes, pixel values, or font sizes unless I stated them. Use directional instructions instead (e.g., "increase padding," "darken the background," "match the design system spacing").
+5. Consolidate related micro-issues affecting the same component into a single task.
+6. Acceptance criteria must be specific and testable.
+7. Number tasks sequentially. Output ONLY the Markdown document.

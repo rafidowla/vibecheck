@@ -114,6 +114,18 @@ class AudioRecorder:
         self._recording = True
         self._paused = False
 
+        # Store the recording start epoch so that temporal correlation in
+        # report generation can correctly map click timestamps to transcript
+        # segment times.  Transcript segments are zero-indexed from this moment.
+        import time as _time
+        _start_epoch = _time.time()
+        try:
+            (session_dir / "recording_start.txt").write_text(
+                str(_start_epoch), encoding="utf-8"
+            )
+        except Exception:
+            pass  # Non-fatal — correlation uses a fallback if missing
+
         self._thread = threading.Thread(target=self._record_loop, daemon=True)
         self._thread.start()
 

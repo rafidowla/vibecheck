@@ -54,8 +54,9 @@ from audit_tool.config import WHISPER_MODEL_SIZE
 
 logger = logging.getLogger(__name__)
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_MODELS_DIR = _PROJECT_ROOT / "models"
+from audit_tool.config import resource_path
+
+_MODELS_DIR = resource_path("models")
 
 # Available models with descriptions and estimated peak RAM.
 WHISPER_MODELS = {
@@ -106,7 +107,12 @@ def _find_whisper_binary() -> str:
     Raises:
         RuntimeError: If the binary is not found.
     """
-    # Prefer native ARM64 binary (Metal GPU) over Intel/Rosetta (CPU-only)
+    # 1. Check for bundled binary inside PyInstaller package
+    bundled = resource_path("bin/whisper-cli")
+    if bundled.exists():
+        return str(bundled)
+
+    # 2. Prefer native ARM64 binary (Metal GPU) over Intel/Rosetta (CPU-only)
     for candidate in [
         "/opt/homebrew/bin/whisper-cli",
         "/opt/homebrew/bin/whisper-cpp",
@@ -315,11 +321,12 @@ def transcribe(
                 binary,
                 "-m", str(model_path),
                 "-f", str(converted_path),
-                "--output-txt",
-                "--print-progress",
-                # Metal GPU is enabled by default in the Homebrew ARM64 build.
-                # Use --threads tuned to half the CPU count to avoid contention
-                # between the CPU and the Metal shader dispatch queue.
+                # --output-srt writes a timestamped .srt subtitle file next to
+                # the audio file.  This is the ONLY reliable way to get
+                # per-segment timestamps — whisper-cli writes nothing to stdout
+                # and the stderr content is implementation-defined (progress
+                # counters, not segment timestamps).
+                "--output-srt",
                 "--threads", str(cpu_threads),
             ],
             capture_output=True,
@@ -337,7 +344,24 @@ def transcribe(
             f"whisper-cpp failed (exit {result.returncode}): {result.stderr[:500]}"
         )
 
-    segments = _parse_whisper_output(result.stdout)
+    # whisper-cli writes nothing to stdout or stderr that we can parse reliably.
+    # Read the .srt file it wrote next to the audio file instead.
+    # Path: <audio_stem>.srt  (e.g. recording_16khz.wav → recording_16khz.wav.srt)
+    srt_path = Path(str(converted_path) + ".srt")
+    segments = _parse_srt_file(srt_path)
+    if not segments:
+        # Fallback: try the original wav_path stem in case whisper used that name
+        srt_path_orig = Path(str(wav_path) + ".srt")
+        segments = _parse_srt_file(srt_path_orig)
+
+    if segments:
+        logger.info(
+            "Parsed %d segments from %s", len(segments), srt_path.name
+        )
+    else:
+        logger.warning(
+            "No timestamped segments found in SRT — temporal correlation will be disabled."
+        )
 
     # Clean up temporary conversion file
     if converted_path != wav_path and converted_path.exists():
@@ -347,7 +371,113 @@ def transcribe(
     return segments
 
 
+def _parse_srt_file(srt_path: Path) -> list[TranscriptSegment]:
+    """Parse a whisper-cli .srt subtitle file into TranscriptSegment objects.
+
+    Purpose:
+        Reliably extracts per-segment timestamps from the .srt file written by
+        ``whisper-cli --output-srt``.  This is the only reliable path —
+        whisper-cli writes nothing useful to stdout or stderr.
+
+    SRT format (produced by whisper-cli):
+        1
+        00:00:00,000 --> 00:00:05,480
+        First segment text here.
+
+        2
+        00:00:05,480 --> 00:00:12,240
+        Second segment text.
+
+    Note: SRT uses comma as the millisecond separator (``HH:MM:SS,mmm``)
+    while ``_parse_whisper_output`` uses dot — these are different formats.
+
+    Args:
+        srt_path: Absolute path to the .srt file.
+
+    Returns:
+        Ordered list of ``TranscriptSegment`` instances, or [] if the file
+        is missing or contains no valid entries.
+
+    Side Effects: Reads one file from disk.
+    Determinism: Deterministic.
+    Idempotency: Yes.
+    Thread Safety: Yes (read-only).
+    """
+    if not srt_path.exists():
+        logger.debug("SRT file not found: %s", srt_path)
+        return []
+
+    # SRT timestamp: HH:MM:SS,mmm --> HH:MM:SS,mmm  (comma for millis)
+    timestamp_pattern = re.compile(
+        r"(\d{2}:\d{2}:\d{2}),(\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}),(\d{3})"
+    )
+
+    segments: list[TranscriptSegment] = []
+    current_start: float | None = None
+    current_end: float | None = None
+    text_lines: list[str] = []
+
+    try:
+        content = srt_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as read_error:
+        logger.warning("Could not read SRT file %s: %s", srt_path, read_error)
+        return []
+
+    for line in content.splitlines():
+        line = line.strip()
+        match = timestamp_pattern.match(line)
+        if match:
+            # Save any previous segment before starting a new one
+            if current_start is not None and text_lines:
+                text = " ".join(text_lines).strip()
+                if text:
+                    segments.append(
+                        TranscriptSegment(
+                            start=current_start,
+                            end=current_end or current_start,
+                            text=text,
+                        )
+                    )
+            # Parse new segment start / end
+            start_hms, start_ms, end_hms, end_ms = match.groups()
+            current_start = _parse_timestamp(start_hms) + int(start_ms) / 1000.0
+            current_end   = _parse_timestamp(end_hms)   + int(end_ms)   / 1000.0
+            text_lines = []
+        elif line.isdigit():
+            # Sequence number line — skip, but flush pending segment first
+            if current_start is not None and text_lines:
+                text = " ".join(text_lines).strip()
+                if text:
+                    segments.append(
+                        TranscriptSegment(
+                            start=current_start,
+                            end=current_end or current_start,
+                            text=text,
+                        )
+                    )
+                current_start = None
+                current_end = None
+                text_lines = []
+        elif line:
+            text_lines.append(line)
+
+    # Flush the final segment
+    if current_start is not None and text_lines:
+        text = " ".join(text_lines).strip()
+        if text:
+            segments.append(
+                TranscriptSegment(
+                    start=current_start,
+                    end=current_end or current_start,
+                    text=text,
+                )
+            )
+
+    return segments
+
+
 def _parse_whisper_output(output: str) -> list[TranscriptSegment]:
+
     """Parse whisper-cpp's stdout into TranscriptSegment objects.
 
     Whisper-cpp outputs lines like:

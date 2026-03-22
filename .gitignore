@@ -24,3 +24,9 @@ Thumbs.db
 # Output (generated reports)
 # Uncomment if you don't want to track outputs:
 # output/
+
+# PyInstaller packaging
+build/bin/
+dist/
+*.dmg
+*.spec.bak

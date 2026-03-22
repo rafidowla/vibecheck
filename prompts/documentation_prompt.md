@@ -38,16 +38,18 @@ Do NOT:
 
 ## Step-by-Step Walkthrough
 
-### Step 1: [Action title]
+### Step 1: [Action title, e.g., "Log in to the dashboard" or "Create a new project"]
 **Screenshot:** click_NNNN.png
 
 [1–3 sentences describing exactly what to do. Use the screenshot to name specific
 buttons, fields, or menus precisely. Write in second person: "Click the…", "Enter your…"]
 
+> 💡 **Tip:** [Include ONLY if I verbally mentioned a tip, shortcut, or caveat at this step. Otherwise omit this callout entirely.]
+
 ### Step 2: …
 
 ## Tips & Gotchas
-[Only include if I specifically mentioned warnings or caveats. Otherwise omit.]
+[Only include if I specifically mentioned overarching warnings or caveats not tied to a single step. Otherwise omit this section.]
 
 ## Acceptance Checklist
 - [ ] [Single testable condition confirming the task is complete.]
@@ -55,5 +57,7 @@ buttons, fields, or menus precisely. Write in second person: "Click the…", "En
 
 ## Rules
 1. Voice narration is always primary. Screenshots supplement — they never override spoken intent.
-2. Second person only: "Click the Save button", not "the user clicks" or "I clicked".
-3. Output ONLY the Markdown document. No preamble, no commentary.
+2. Second person only: "Click the **Save** button", "Enter your email" — not "the user clicks" or "I clicked".
+3. Step titles must be action-oriented and specific (e.g., "Configure notification settings"), not generic (e.g., "Step 3").
+4. Per-step tip callouts must ONLY appear when I verbally mentioned a tip at that step. Do not invent tips.
+5. Output ONLY the Markdown document. No preamble, no commentary.

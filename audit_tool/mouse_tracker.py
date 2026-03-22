@@ -37,6 +37,8 @@ Thread Safety: The pynput listener runs on its own thread; screenshot I/O
 from __future__ import annotations
 
 import logging
+import queue
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -108,6 +110,18 @@ class MouseTracker:
         self._active: bool = False
         self._paused: bool = False
         self._sct: Optional[mss.mss] = None
+        # Coordinate correction factor for pynput in .app bundles.
+        # On macOS Retina displays, pynput (CGEvent) may report coordinates
+        # in a different scale than mss's logical points.  Detected at start().
+        self._pynput_scale_x: float = 1.0
+        self._pynput_scale_y: float = 1.0
+        # Background worker thread + queue for screenshot capture.
+        # The pynput CGEventTap callback MUST return immediately; if it blocks
+        # for more than ~5ms macOS auto-disables the event tap, silently
+        # dropping all future click events.  We enqueue the raw click data
+        # and let the worker thread do the heavy I/O.
+        self._click_queue: queue.Queue = queue.Queue()
+        self._worker_thread: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------
     # Public interface
@@ -156,9 +170,87 @@ class MouseTracker:
         self._active = True
         self._paused = False
         self._sct = mss.mss()
+        # Record the moment tracking starts so we can suppress the
+        # "Start Recording" button click itself (warmup window).
+        self._tracking_start_epoch: float = time.time()
+
+        # Detect pynput ↔ mss coordinate mismatch on macOS Retina.
+        self._detect_pynput_scale()
+
+        # Start the background screenshot worker BEFORE the listener so
+        # the queue is being drained as soon as clicks arrive.
+        self._click_queue = queue.Queue()
+        self._worker_thread = threading.Thread(
+            target=self._screenshot_worker,
+            name="VibeCheck-ClickWorker",
+            daemon=True,
+        )
+        self._worker_thread.start()
 
         self._listener = mouse.Listener(on_click=self._on_click)
         self._listener.start()
+
+    def _detect_pynput_scale(self) -> None:
+        """Detect coordinate scaling mismatch between pynput and mss.
+
+        On macOS Retina displays, pynput (via CGEvent) may report click
+        coordinates in a different scale than mss's logical-point system.
+        This is especially common when running inside a PyInstaller .app
+        bundle where the coordinate spaces can diverge.
+
+        This method compares the main display bounds as reported by Quartz
+        (physical pixels) with the mss monitor dimensions (logical points)
+        to compute a correction factor.
+
+        Side Effects:
+            Sets ``_pynput_scale_x`` and ``_pynput_scale_y``.
+
+        Determinism: Deterministic for a given display configuration.
+        Idempotency: Yes — safe to call multiple times.
+        """
+        import platform as _platform
+
+        if _platform.system() != "Darwin":
+            return
+
+        try:
+            import Quartz
+
+            # Quartz reports the main display in logical points
+            main_display = Quartz.CGMainDisplayID()
+            cg_bounds = Quartz.CGDisplayBounds(main_display)
+            cg_width = cg_bounds.size.width
+            cg_height = cg_bounds.size.height
+
+            # mss reports the main display (index 1) in logical points
+            if self._sct and len(self._sct.monitors) > 1:
+                mss_mon = self._sct.monitors[1]  # main display
+                mss_width = mss_mon["width"]
+                mss_height = mss_mon["height"]
+
+                if cg_width > 0 and cg_height > 0:
+                    self._pynput_scale_x = mss_width / cg_width
+                    self._pynput_scale_y = mss_height / cg_height
+
+                    if (abs(self._pynput_scale_x - 1.0) > 0.01
+                            or abs(self._pynput_scale_y - 1.0) > 0.01):
+                        logger.info(
+                            "Pynput coordinate correction: scale_x=%.3f, "
+                            "scale_y=%.3f (Quartz main=%.0fx%.0f, "
+                            "mss main=%dx%d)",
+                            self._pynput_scale_x, self._pynput_scale_y,
+                            cg_width, cg_height,
+                            mss_width, mss_height,
+                        )
+                    else:
+                        logger.debug(
+                            "No pynput coordinate correction needed "
+                            "(scale factors ≈ 1.0)."
+                        )
+        except ImportError:
+            logger.debug("Quartz not available — skipping pynput scale detection.")
+        except Exception:
+            logger.exception("Failed to detect pynput coordinate scale.")
 
     def pause(self) -> None:
         """Pause click tracking.  Clicks are ignored until resumed."""
@@ -205,6 +297,13 @@ class MouseTracker:
             self._listener.stop()
             self._listener = None
 
+        # Signal the worker thread to finish and wait for any in-flight
+        # screenshots to complete before we close the mss context.
+        if self._worker_thread is not None:
+            self._click_queue.put(None)   # sentinel: tells worker to exit
+            self._worker_thread.join(timeout=10.0)
+            self._worker_thread = None
+
         if self._sct is not None:
             self._sct.close()
             self._sct = None
@@ -228,30 +327,137 @@ class MouseTracker:
         button: mouse.Button,
         pressed: bool,
     ) -> None:
-        """Callback fired on every mouse click event.
+        """Callback fired on every global mouse event (CGEventTap).
 
-        Only processes *press* events (ignores releases) to avoid duplicates.
-        Skips capture when paused.
+        CRITICAL — this method MUST do ZERO I/O and return in microseconds.
+        Any file open/write/close or syscall here can delay the CGEventTap
+        callback long enough for macOS to stop delivering events — silently
+        dropping all subsequent clicks for the rest of the session.
+
+        This callback only:
+          1. Checks guard conditions (press-only, active, warmup).
+          2. Records the timestamp (time.time() is a fast VDSO call).
+          3. Pushes a lightweight tuple to ``_click_queue`` (non-blocking).
+
+        ALL I/O — screenshots, Pillow, disk writes, diagnostic logging —
+        is done in ``_screenshot_worker`` on a background thread.
+
+        Side Effects:
+            Enqueues a tuple for the worker thread.
         """
         if not pressed or not self._active or self._paused:
             return
 
-        try:
-            screenshot_path = self._capture_and_annotate(x, y)
-            record = ClickRecord(
-                index=self._click_counter,
-                timestamp=time.time(),
-                x=x,
-                y=y,
-                screenshot_path=screenshot_path,
-                monitor_index=self._monitor_index,
-            )
-            self._clicks.append(record)
-            self._click_counter += 1
-        except Exception:
-            logger.exception("Failed to capture screenshot for click at (%d, %d)", x, y)
+        click_ts = time.time()
+        elapsed = click_ts - self._tracking_start_epoch
 
-    def _capture_and_annotate(self, click_x: int, click_y: int) -> Path:
+        # No I/O here. Pass everything the worker needs via the queue.
+        # is_warmup=True items are logged-only (not captured as screenshots).
+        is_warmup = elapsed < 3.0
+        self._click_queue.put((x, y, click_ts, elapsed, button.name, is_warmup))
+
+
+    def _screenshot_worker(self) -> None:
+        """Background worker: drains ``_click_queue`` and captures screenshots.
+
+        Runs on a dedicated daemon thread so the CGEventTap callback
+        can return instantly.  Processes one click at a time to avoid
+        concurrent mss/Pillow state.
+
+        Exits when ``None`` is dequeued (sentinel sent by ``stop()``).
+
+        Side Effects:
+            Captures screenshots via mss, writes PNGs to disk, appends
+            to ``self._clicks``.
+        """
+        while True:
+            item = self._click_queue.get()
+            if item is None:  # sentinel from stop()
+                break
+
+            x_raw, y_raw, click_ts, elapsed, button_name, is_warmup = item
+
+            # Apply pynput coordinate correction for .app bundles.
+            x = x_raw * self._pynput_scale_x
+            y = y_raw * self._pynput_scale_y
+
+            # Write the RECEIVED log entry here (worker thread, not callback).
+            try:
+                _log = Path.home() / ".vibecheck" / "clicks.log"
+                _log.parent.mkdir(parents=True, exist_ok=True)
+                with _log.open("a", encoding="utf-8") as _f:
+                    tag = "WARMUP " if is_warmup else "RECEIVED"
+                    _f.write(
+                        f"{tag}: btn={button_name} "
+                        f"raw=({x_raw:.1f},{y_raw:.1f}) epoch={click_ts:.3f} "
+                        f"T+{elapsed:.2f}s\n"
+                    )
+            except Exception:
+                pass
+
+            # Warmup clicks: logged above but not captured as screenshots.
+            if is_warmup:
+                continue
+
+            if self._sct is None:
+                logger.debug("mss context gone — skipping queued click at (%g,%g).", x, y)
+                continue
+
+            # Find which monitor the click landed on.
+            capture_monitor_index = self._monitor_index
+            for idx, mon in enumerate(self._sct.monitors[1:], start=1):
+                if (mon["left"] <= x < mon["left"] + mon["width"]
+                        and mon["top"] <= y < mon["top"] + mon["height"]):
+                    capture_monitor_index = idx
+                    break
+            else:
+                try:
+                    _log = Path.home() / ".vibecheck" / "clicks.log"
+                    with _log.open("a", encoding="utf-8") as _f:
+                        _f.write(
+                            f"NOMATCH: ({x:.1f},{y:.1f}) epoch={time.time():.3f} "
+                            f"— not on any of {len(self._sct.monitors)-1} monitors\n"
+                        )
+                except Exception:
+                    pass
+                logger.warning("Click at (%g,%g) not on any monitor — skipping.", x, y)
+                continue
+
+            if capture_monitor_index != self._monitor_index:
+                logger.info(
+                    "Click at (%g,%g) is on monitor %d — capturing that monitor.",
+                    x, y, capture_monitor_index,
+                )
+
+            # Brief delay so macOS finishes rendering the click's UI changes.
+            time.sleep(0.05)
+
+            try:
+                screenshot_path = self._capture_and_annotate(
+                    x, y, monitor_index=capture_monitor_index
+                )
+                record = ClickRecord(
+                    index=self._click_counter,
+                    timestamp=click_ts,
+                    x=int(x),
+                    y=int(y),
+                    screenshot_path=screenshot_path,
+                    monitor_index=capture_monitor_index,
+                )
+                self._clicks.append(record)
+                self._click_counter += 1
+            except Exception:
+                logger.exception("Worker failed to capture screenshot at (%g,%g).", x, y)
+
+
+
+
+    def _capture_and_annotate(
+        self,
+        click_x: int,
+        click_y: int,
+        monitor_index: int | None = None,
+    ) -> Path:
         """Capture a screenshot, draw a click marker, and save.
 
         On HiDPI / Retina displays, ``pynput`` reports logical-point coordinates
@@ -264,6 +470,10 @@ class MouseTracker:
         Args:
             click_x: Absolute X position of the click in *logical* screen points.
             click_y: Absolute Y position of the click in *logical* screen points.
+            monitor_index: ``mss`` monitor index to capture.  If ``None``, uses
+                ``self._monitor_index`` (the user-selected default).  Pass an
+                explicit value when the click landed on a different monitor than
+                the pre-selected one (multi-monitor layouts).
 
         Returns:
             Path to the saved annotated PNG.
@@ -274,7 +484,8 @@ class MouseTracker:
         assert self._sct is not None
         assert self._session_dir is not None
 
-        monitor = self._sct.monitors[self._monitor_index]
+        _mon_idx = monitor_index if monitor_index is not None else self._monitor_index
+        monitor = self._sct.monitors[_mon_idx]
 
         # Capture the raw screenshot (dimensions are in physical pixels).
         raw = self._sct.grab(monitor)
@@ -295,9 +506,35 @@ class MouseTracker:
         local_x = int((click_x - monitor["left"]) * scale_x)
         local_y = int((click_y - monitor["top"]) * scale_y)
 
-        # Clamp to image bounds to prevent drawing outside the canvas.
+        # ── Clamp to image bounds ──
+        # This is a last-resort guard. By the time we reach _capture_and_annotate
+        # the bounds check in _on_click should have already rejected out-of-range
+        # clicks. However, floating-point rounding or monitor hotplug edge cases
+        # can still produce a local pixel that is slightly outside the canvas.
         local_x = max(0, min(local_x, physical_width - 1))
         local_y = max(0, min(local_y, physical_height - 1))
+
+        # Diagnostic log — written AFTER clamping so the logged values always
+        # reflect what will actually be drawn onto the screenshot.
+        try:
+            import time as _time
+            from pathlib import Path as _Path
+            _log = _Path.home() / ".vibecheck" / "clicks.log"
+            _log.parent.mkdir(parents=True, exist_ok=True)
+            _epoch = _time.time()
+            with _log.open("a", encoding="utf-8") as _f:
+                _f.write(
+                    f"Click: raw_pynput=({click_x:.1f},{click_y:.1f}) "
+                    f"epoch={_epoch:.3f} "
+                    f"mon_idx={self._monitor_index} "
+                    f"mon_bounds=(left={monitor['left']},top={monitor['top']},"
+                    f"w={monitor['width']},h={monitor['height']}) "
+                    f"capture_size={physical_width}x{physical_height} "
+                    f"scale=({scale_x:.3f},{scale_y:.3f}) "
+                    f"local_pixel=({local_x},{local_y})\n"
+                )
+        except Exception:
+            pass
 
         # Scale the marker radius/width proportionally so it looks the same
         # visual size regardless of DPI.

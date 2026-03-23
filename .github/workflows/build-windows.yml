@@ -1,0 +1,106 @@
+# ---------------------------------------------------------------------------
+# build-windows.yml — GitHub Actions: Build VibeCheck for Windows
+#
+# Purpose:
+#     Spins up a cloud Windows runner, downloads whisper-cli.exe, runs
+#     PyInstaller, packages a VibeCheckSetup.exe via NSIS, and uploads
+#     the installer as a downloadable build artifact.
+#
+# Triggers:
+#     - Every push to `main` that touches source or build files.
+#     - Manual trigger (workflow_dispatch) from the GitHub Actions UI.
+#
+# Output:
+#     Downloadable artifact: VibeCheckSetup.exe  (zip-wrapped by GH Actions)
+#
+# Side Effects:
+#     Produces dist/VibeCheckSetup.exe inside the runner — does NOT commit
+#     anything back to the repo. Download it from the Actions run page.
+# ---------------------------------------------------------------------------
+
+name: Build Windows Installer
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'audit_tool/**'
+      - 'vibecheck.spec'
+      - 'requirements.txt'
+      - 'build/build_windows.ps1'
+      - 'build/vibecheck.nsi'
+      - '.github/workflows/build-windows.yml'
+  workflow_dispatch:   # Manual trigger from the GitHub Actions UI
+
+jobs:
+  build-windows:
+    name: Build on Windows
+    runs-on: windows-latest
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. Check out the full repository
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # 2. Set up Python 3.12
+      # -----------------------------------------------------------------------
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # -----------------------------------------------------------------------
+      # 3. Download whisper-cli.exe from the latest whisper.cpp release
+      #    The Windows binary is distributed as a zip on the GitHub releases page.
+      # -----------------------------------------------------------------------
+      - name: Download whisper-cli.exe
+        shell: pwsh
+        run: |
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/ggerganov/whisper.cpp/releases/latest"
+          $asset   = $release.assets | Where-Object { $_.name -match "whisper-.*-bin-WIN.*x64.*\.zip" } | Select-Object -First 1
+          if (-not $asset) {
+            Write-Error "Could not find a Windows whisper.cpp release asset. Available: $($release.assets.name -join ', ')"
+            exit 1
+          }
+          Write-Host "Downloading: $($asset.browser_download_url)"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile whisper_win.zip
+          Expand-Archive -Path whisper_win.zip -DestinationPath whisper_extracted -Force
+          $exe = Get-ChildItem -Recurse whisper_extracted -Filter "whisper-cli.exe" | Select-Object -First 1
+          if (-not $exe) {
+            Write-Error "whisper-cli.exe not found inside the zip."
+            exit 1
+          }
+          New-Item -ItemType Directory -Force -Path build\bin | Out-Null
+          Copy-Item $exe.FullName build\bin\whisper-cli.exe
+          Write-Host "Copied whisper-cli.exe to build\bin\"
+
+      # -----------------------------------------------------------------------
+      # 4. Install NSIS (the installer builder used by vibecheck.nsi)
+      # -----------------------------------------------------------------------
+      - name: Install NSIS
+        shell: pwsh
+        run: choco install nsis --no-progress -y
+
+      # -----------------------------------------------------------------------
+      # 5. Run the Windows build script
+      #    This handles: venv, pip install, PyInstaller, and makensis.
+      # -----------------------------------------------------------------------
+      - name: Run build_windows.ps1
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+          .\build\build_windows.ps1
+
+      # -----------------------------------------------------------------------
+      # 6. Upload the installer as a downloadable GitHub Actions artifact
+      # -----------------------------------------------------------------------
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VibeCheckSetup-Windows
+          path: dist\VibeCheckSetup.exe
+          retention-days: 30
+          if-no-files-found: error

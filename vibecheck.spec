@@ -74,7 +74,8 @@ a = Analysis(
         "mss",
         "sounddevice",
         "soundfile",
-        "Quartz",
+        # Quartz is macOS-only — Windows builds omit it entirely
+        *( ["Quartz"] if platform.system() == "Darwin" else [] ),
         # HTTP / networking — needed for OpenRouter API calls
         "httpx",
         "httpx._transports",
